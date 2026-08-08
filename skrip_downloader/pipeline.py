@@ -86,7 +86,26 @@ def process_date(day: int, month: int, year: int, logger: logging.Logger) -> Dic
     w_url = discovery.wrapper_url(day, month, year)
     p_url = discovery.pages_url(day, month, year)
 
-    wrapper_resp = discovery.fetch_wrapper(session, day, month, year, logger)
+    # A network-level failure (timeout, connection reset, retries exhausted)
+    # raises rather than returning a response. During an unattended
+    # full-year crawl this must degrade to status="error" for this one date
+    # and let the caller move on -- it must never crash the whole run, and
+    # it must never be confused with a genuine "missing" issue.
+    try:
+        wrapper_resp = discovery.fetch_wrapper(session, day, month, year, logger)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            logger, issue_id=issue_id, issue_date=issue_date, page_number=None,
+            action="FETCH_WRAPPER_ERROR", source_url=w_url, local_path=None,
+            status="error", extra=f"error={exc}",
+        )
+        registry.update_registry_entry(
+            year, issue_date, issue_id=issue_id, status="error",
+            pages_expected=0, pages_downloaded=0, merged_pdf_path=None,
+            error=f"pdfwin.asp request failed: {exc}",
+        )
+        return {"status": "error", "issue_id": issue_id, "pages_expected": 0, "pages_downloaded": 0}
+
     log_event(
         logger, issue_id=issue_id, issue_date=issue_date, page_number=None,
         action="FETCH_WRAPPER", source_url=w_url, local_path=None,
@@ -113,7 +132,21 @@ def process_date(day: int, month: int, year: int, logger: logging.Logger) -> Dic
         )
         return {"status": "error", "issue_id": issue_id, "pages_expected": 0, "pages_downloaded": 0}
 
-    pages_resp = discovery.fetch_pages_html(session, day, month, year, logger, referer=w_url)
+    try:
+        pages_resp = discovery.fetch_pages_html(session, day, month, year, logger, referer=w_url)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            logger, issue_id=issue_id, issue_date=issue_date, page_number=None,
+            action="FETCH_PAGES_ERROR", source_url=p_url, local_path=None,
+            status="error", extra=f"error={exc}",
+        )
+        registry.update_registry_entry(
+            year, issue_date, issue_id=issue_id, status="error",
+            pages_expected=0, pages_downloaded=0, merged_pdf_path=None,
+            error=f"pages.asp request failed: {exc}",
+        )
+        return {"status": "error", "issue_id": issue_id, "pages_expected": 0, "pages_downloaded": 0}
+
     log_event(
         logger, issue_id=issue_id, issue_date=issue_date, page_number=None,
         action="FETCH_PAGES", source_url=p_url, local_path=None,
@@ -260,7 +293,7 @@ def process_date(day: int, month: int, year: int, logger: logging.Logger) -> Dic
                 pages_expected=data["pages_expected"], pages_downloaded=data["pages_downloaded"],
                 merged_pdf_path=merged_info["path"], error=None,
             )
-        except merge.MergeError as exc:
+        except Exception as exc:  # noqa: BLE001 - a merge failure must not crash the crawl
             data["status"] = "partial"
             manifest_mod.save_manifest(year, issue_id, data)
             log_event(
