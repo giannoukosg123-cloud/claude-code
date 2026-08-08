@@ -3,17 +3,24 @@
 Usage:
     python3 -m skrip_downloader.run --dates 1922-01-01 1922-01-03
     python3 -m skrip_downloader.run --year 1922
+    python3 -m skrip_downloader.run --from 1924-10-01 --to 1924-12-31
 
---dates processes an explicit list of dates (must all share one year).
---year processes every calendar date in that year, sequentially, then
-immediately runs a second full pass over the same dates to verify that
-already-complete/missing issues are skipped and nothing on disk changes.
+--dates processes an explicit list of dates (must all share one year), one
+pass, one summary -- for small ad-hoc/live-validation checks.
+
+--year and --from/--to both process every calendar date in the requested
+span, sequentially, then immediately run a second full pass over the same
+dates to verify that already-complete/missing issues are skipped and
+nothing on disk changes. A span is grouped by calendar year internally so
+each date's log lines and registry entry always land in that date's own
+year's files (data/raw/skrip/<year>/issues_registry.json,
+logs/skrip/<year>.log) -- years are never mixed, even if a --from/--to
+span happened to cross a year boundary.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 from collections import Counter
 from datetime import date, timedelta
 from typing import Any, Dict, List
@@ -31,34 +38,69 @@ from .verification import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SKRIP (ΣΚΡΙΠ) issue downloader")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
+    parser.add_argument(
         "--dates",
         nargs="+",
-        help="Dates to process, format YYYY-MM-DD (e.g. 1922-01-01 1922-01-03)",
+        help="Dates to process, format YYYY-MM-DD (e.g. 1922-01-01 1922-01-03). "
+             "Single pass, must all share one year.",
     )
-    group.add_argument(
+    parser.add_argument(
         "--year",
         type=int,
-        help="Process every calendar date in this year, sequentially (e.g. 1922).",
+        help="Process every calendar date in this year, sequentially, with an "
+             "automatic second verification pass (e.g. 1922).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--from",
+        dest="date_from",
+        help="Start date YYYY-MM-DD of a range (must be used together with --to).",
+    )
+    parser.add_argument(
+        "--to",
+        dest="date_to",
+        help="End date YYYY-MM-DD of a range, inclusive (must be used together with --from).",
+    )
+    args = parser.parse_args()
+
+    modes_selected = sum([
+        bool(args.dates),
+        args.year is not None,
+        bool(args.date_from or args.date_to),
+    ])
+    if modes_selected != 1:
+        parser.error("Specify exactly one of: --dates, --year, or --from/--to together.")
+    if bool(args.date_from) != bool(args.date_to):
+        parser.error("--from and --to must be given together.")
+
+    return args
 
 
 def year_dates(year: int) -> List[date]:
-    d = date(year, 1, 1)
-    end = date(year, 12, 31)
+    return dates_in_range(date(year, 1, 1), date(year, 12, 31))
+
+
+def dates_in_range(date_from: date, date_to: date) -> List[date]:
+    if date_to < date_from:
+        raise ValueError(f"--to ({date_to}) must not be before --from ({date_from}).")
     out = []
-    while d <= end:
+    d = date_from
+    while d <= date_to:
         out.append(d)
         d += timedelta(days=1)
     return out
 
 
+def group_by_year(dates: List[date]) -> Dict[int, List[date]]:
+    groups: Dict[int, List[date]] = {}
+    for d in dates:
+        groups.setdefault(d.year, []).append(d)
+    return groups
+
+
 def safe_process_date(day: int, month: int, year: int, logger) -> Dict[str, Any]:
-    """process_date must never take down an unattended full-year crawl.
-    Any exception that escapes it is recorded as this one date's status
-    ("error", never "missing") and the crawl moves on."""
+    """process_date must never take down an unattended crawl. Any exception
+    that escapes it is recorded as this one date's status ("error", never
+    "missing") and the crawl moves on to the next date."""
     issue_date = f"{year:04d}-{month:02d}-{day:02d}"
     issue_id = f"{config.NEWSPAPER_CODE}_{issue_date}"
     try:
@@ -109,7 +151,7 @@ def summarize(results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def print_summary(title: str, summary: Dict[str, Any], year: int) -> None:
+def print_summary(title: str, summary: Dict[str, Any], years: List[int]) -> None:
     print(f"\n===== {title} =====")
     print(f"Total dates checked: {summary['total_dates_checked']}")
     print(f"Complete: {len(summary['complete'])}")
@@ -119,9 +161,10 @@ def print_summary(title: str, summary: Dict[str, Any], year: int) -> None:
     print(f"Total pages downloaded: {summary['total_pages_downloaded']}")
     print(f"Total merged PDFs: {summary['total_merged_pdfs']}")
     print(f"Total bytes downloaded (merged PDFs): {summary['total_bytes_downloaded']}")
-    print(f"issues_registry.json: {registry.registry_path(year)}")
-    print(f"log file: {config.LOG_ROOT / f'{year}.log'}")
-    print(f"merged issues folder: {config.ISSUES_ROOT / str(year)}")
+    for y in years:
+        print(f"[{y}] issues_registry.json: {registry.registry_path(y)}")
+        print(f"[{y}] log file: {config.LOG_ROOT / f'{y}.log'}")
+        print(f"[{y}] merged issues folder: {config.ISSUES_ROOT / str(y)}")
 
     if summary["missing"]:
         print(f"\nMissing dates ({len(summary['missing'])}):")
@@ -138,7 +181,7 @@ def print_summary(title: str, summary: Dict[str, Any], year: int) -> None:
 
 
 def print_directory_tree(year: int) -> None:
-    print("\n===== Directory tree (summary) =====")
+    print(f"\n===== Directory tree (summary) - {year} =====")
     raw_year_dir = config.RAW_ROOT / str(year)
     issues_year_dir = config.ISSUES_ROOT / str(year)
 
@@ -162,60 +205,75 @@ def print_directory_tree(year: int) -> None:
             print(f"  ... ({len(merged_files) - 5} more merged PDFs)")
 
 
-def run_year(year: int, logger) -> None:
-    dates = year_dates(year)
+def run_crawl(dates: List[date], label: str) -> None:
+    """Shared two-pass (crawl + verify) driver behind both --year and
+    --from/--to. Groups dates by calendar year so every date's log lines
+    and registry entry go exclusively to that year's own files."""
+    groups = group_by_year(dates)
+    years = sorted(groups)
+    loggers = {y: setup_logger(y) for y in years}
 
-    print(f"########## PASS 1: full-year crawl for {year} ({len(dates)} dates) ##########")
-    results_pass1 = run_dates(dates, logger)
+    print(f"########## PASS 1: {label} ({len(dates)} dates across year(s) {years}) ##########")
+    results_pass1: Dict[str, Dict[str, Any]] = {}
+    for y in years:
+        results_pass1.update(run_dates(groups[y], loggers[y]))
     summary1 = summarize(results_pass1)
-    print_summary(f"PASS 1 SUMMARY - {year}", summary1, year)
+    print_summary(f"PASS 1 SUMMARY - {label}", summary1, years)
 
-    violations = find_cross_contamination(year)
+    violations: List[str] = []
+    for y in years:
+        violations.extend(find_cross_contamination(y))
     print(f"\nCross-contamination check: {'CLEAN' if not violations else 'VIOLATIONS FOUND'}")
     for v in violations:
         print(f"  VIOLATION: {v}")
 
-    merged_before = snapshot_merged_pdfs(year)
-    pages_before = snapshot_raw_page_files(year)
+    merged_before = {y: snapshot_merged_pdfs(y) for y in years}
+    pages_before = {y: snapshot_raw_page_files(y) for y in years}
 
-    print(f"\n########## PASS 2: full-year verification re-run for {year} ##########")
-    results_pass2 = run_dates(dates, logger)
+    print(f"\n########## PASS 2: verification re-run - {label} ##########")
+    results_pass2: Dict[str, Dict[str, Any]] = {}
+    for y in years:
+        results_pass2.update(run_dates(groups[y], loggers[y]))
     summary2 = summarize(results_pass2)
-    print_summary(f"PASS 2 SUMMARY - {year}", summary2, year)
-
-    merged_after = snapshot_merged_pdfs(year)
-    pages_after = snapshot_raw_page_files(year)
-
-    merged_diff = diff_snapshots(merged_before, merged_after)
-    pages_diff = diff_snapshots(pages_before, pages_after)
+    print_summary(f"PASS 2 SUMMARY - {label}", summary2, years)
 
     print("\n===== PASS 2 IDEMPOTENCY VERIFICATION =====")
-    print(f"Merged PDFs added:   {merged_diff['added'] or 'none'}")
-    print(f"Merged PDFs removed: {merged_diff['removed'] or 'none'}")
-    print(f"Merged PDFs changed (sha256/bytes differ): {merged_diff['changed'] or 'none'}")
-    print(f"Raw page files added:   {len(pages_diff['added'])}")
-    print(f"Raw page files removed: {len(pages_diff['removed'])}")
-    print(f"Raw page files changed: {len(pages_diff['changed'])}")
+    idempotent_all = True
+    for y in years:
+        merged_diff = diff_snapshots(merged_before[y], snapshot_merged_pdfs(y))
+        pages_diff = diff_snapshots(pages_before[y], snapshot_raw_page_files(y))
+        print(f"-- Year {y} --")
+        print(f"  Merged PDFs added:   {merged_diff['added'] or 'none'}")
+        print(f"  Merged PDFs removed: {merged_diff['removed'] or 'none'}")
+        print(f"  Merged PDFs changed (sha256/bytes differ): {merged_diff['changed'] or 'none'}")
+        print(f"  Raw page files added/removed/changed: "
+              f"{len(pages_diff['added'])}/{len(pages_diff['removed'])}/{len(pages_diff['changed'])}")
+        if any(merged_diff["added"] or merged_diff["removed"] or merged_diff["changed"]
+               or pages_diff["added"] or pages_diff["removed"] or pages_diff["changed"]):
+            idempotent_all = False
 
-    idempotent = not any(
-        merged_diff["added"] or merged_diff["removed"] or merged_diff["changed"]
-        or pages_diff["added"] or pages_diff["removed"] or pages_diff["changed"]
-    )
-    print(f"\nIDEMPOTENT SECOND RUN: {'YES' if idempotent else 'NO -- INVESTIGATE'}")
+    print(f"\nIDEMPOTENT SECOND RUN: {'YES' if idempotent_all else 'NO -- INVESTIGATE'}")
 
-    print_directory_tree(year)
-
-    print(f"\nAll merged PDFs are located together under: {config.ISSUES_ROOT / str(year)}")
+    for y in years:
+        print_directory_tree(y)
+        print(f"\nAll merged PDFs for {y} are located together under: {config.ISSUES_ROOT / str(y)}")
 
 
 def main() -> None:
     args = parse_args()
 
-    if args.year:
-        logger = setup_logger(args.year)
-        run_year(args.year, logger)
+    if args.year is not None:
+        run_crawl(year_dates(args.year), label=f"full-year crawl for {args.year}")
         return
 
+    if args.date_from:
+        date_from = date.fromisoformat(args.date_from)
+        date_to = date.fromisoformat(args.date_to)
+        dates = dates_in_range(date_from, date_to)
+        run_crawl(dates, label=f"date-range crawl {date_from.isoformat()} -> {date_to.isoformat()}")
+        return
+
+    # --dates: single explicit list, single pass, single year (original behavior).
     dates = [date.fromisoformat(d) for d in args.dates]
     years = {d.year for d in dates}
     if len(years) != 1:
@@ -225,7 +283,7 @@ def main() -> None:
     logger = setup_logger(year)
     results = run_dates(sorted(dates), logger)
     summary = summarize(results)
-    print_summary(f"SUMMARY - {year}", summary, year)
+    print_summary(f"SUMMARY - {year}", summary, [year])
 
 
 if __name__ == "__main__":
