@@ -36,6 +36,7 @@ skrip_downloader/find_next.py for the full contract.
 from __future__ import annotations
 
 import argparse
+import calendar
 from collections import Counter
 from datetime import date, timedelta
 from typing import Any, Dict, List
@@ -208,6 +209,38 @@ def print_summary(title: str, summary: Dict[str, Any], years: List[int]) -> None
             print(f"  {d}")
 
 
+def monthly_breakdown(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    """{'YYYY-MM': {'complete': n, 'missing': n, 'partial': n, 'error': n, 'total': n}}, sorted chronologically."""
+    counters: Dict[str, Counter] = {}
+    for date_str, r in results.items():
+        year_month = date_str[:7]
+        counters.setdefault(year_month, Counter())[r.get("status")] += 1
+
+    breakdown = {}
+    for year_month in sorted(counters):
+        c = counters[year_month]
+        breakdown[year_month] = {
+            "complete": c.get("complete", 0),
+            "missing": c.get("missing", 0),
+            "partial": c.get("partial", 0),
+            "error": c.get("error", 0),
+            "total": sum(c.values()),
+        }
+    return breakdown
+
+
+def print_monthly_breakdown(title: str, results: Dict[str, Dict[str, Any]]) -> None:
+    print(f"\n===== {title} =====")
+    for year_month, counts in monthly_breakdown(results).items():
+        y, m = year_month.split("-")
+        month_name = calendar.month_name[int(m)]
+        print(
+            f"{month_name} {y}: total={counts['total']:3d}  "
+            f"complete={counts['complete']:3d}  missing={counts['missing']:3d}  "
+            f"partial={counts['partial']:3d}  error={counts['error']:3d}"
+        )
+
+
 def print_directory_tree(year: int) -> None:
     print(f"\n===== Directory tree (summary) - {year} =====")
     raw_year_dir = config.RAW_ROOT / str(year)
@@ -250,6 +283,7 @@ def run_crawl(dates: List[date], label: str, verify_only: bool = False) -> None:
             results.update(run_dates(groups[y], loggers[y]))
         summary = summarize(results)
         print_summary(f"CRAWL SUMMARY - {label}", summary, years)
+        print_monthly_breakdown(f"MONTHLY BREAKDOWN - {label}", results)
     else:
         print(f"########## VERIFY ONLY (offline, no crawl, no network, no writes): "
               f"{label} ({len(dates)} dates across year(s) {years}) ##########")
