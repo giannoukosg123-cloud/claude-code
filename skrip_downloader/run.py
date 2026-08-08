@@ -5,6 +5,7 @@ Usage:
     python3 -m skrip_downloader.run --year 1922
     python3 -m skrip_downloader.run --from 1924-10-01 --to 1924-12-31
     python3 -m skrip_downloader.run --verify --from 1923-01-01 --to 1923-10-31
+    python3 -m skrip_downloader.run --find-next 1923-01-22
 
 --dates processes an explicit list of dates (must all share one year), one
 pass, one summary -- for small ad-hoc/live-validation checks.
@@ -23,6 +24,13 @@ happened to cross a year boundary.
 the crawl entirely and only runs the offline verification pass described
 above. No network requests, no writes to manifest.json/issues_registry.json,
 not even a log file is created.
+
+--find-next YYYY-MM-DD is a discovery mode: starting from that date
+(inclusive), it live-rechecks dates sequentially through Dec 31 of that
+year -- ignoring any stale "missing" a previous crawl may have recorded --
+until it finds the first date with a live-confirmed available issue,
+downloads+merges only that one issue, then stops. See
+skrip_downloader/find_next.py for the full contract.
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ from collections import Counter
 from datetime import date, timedelta
 from typing import Any, Dict, List
 
-from . import config, local_verify, registry
+from . import config, find_next, local_verify, registry
 from .logging_setup import setup_logger, log_event
 from .pipeline import process_date
 
@@ -68,17 +76,29 @@ def parse_args() -> argparse.Namespace:
              "no network calls, no writes to manifest.json or issues_registry.json. "
              "Must be combined with --dates, --year, or --from/--to.",
     )
+    parser.add_argument(
+        "--find-next",
+        dest="find_next",
+        metavar="YYYY-MM-DD",
+        help="Search forward from this date (inclusive) through Dec 31 of that year for "
+             "the first live-confirmed available issue; downloads+merges only that one "
+             "issue, then stops. Live-rechecks every date whose last known status isn't "
+             "'complete' (ignores stale 'missing' from a previous crawl). A standalone mode.",
+    )
     args = parser.parse_args()
 
     modes_selected = sum([
         bool(args.dates),
         args.year is not None,
         bool(args.date_from or args.date_to),
+        bool(args.find_next),
     ])
     if modes_selected != 1:
-        parser.error("Specify exactly one of: --dates, --year, or --from/--to together.")
+        parser.error("Specify exactly one of: --dates, --year, --from/--to, or --find-next.")
     if bool(args.date_from) != bool(args.date_to):
         parser.error("--from and --to must be given together.")
+    if args.find_next and args.verify:
+        parser.error("--verify cannot be combined with --find-next (find-next always live-checks).")
 
     return args
 
@@ -244,6 +264,13 @@ def run_crawl(dates: List[date], label: str, verify_only: bool = False) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    if args.find_next:
+        start = date.fromisoformat(args.find_next)
+        logger = setup_logger(start.year)
+        report = find_next.find_next_available_issue(start, logger)
+        find_next.print_find_next_report(report)
+        return
 
     if args.year is not None:
         mode = "verify" if args.verify else "crawl"
