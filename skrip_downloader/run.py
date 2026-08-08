@@ -4,18 +4,25 @@ Usage:
     python3 -m skrip_downloader.run --dates 1922-01-01 1922-01-03
     python3 -m skrip_downloader.run --year 1922
     python3 -m skrip_downloader.run --from 1924-10-01 --to 1924-12-31
+    python3 -m skrip_downloader.run --verify --from 1923-01-01 --to 1923-10-31
 
 --dates processes an explicit list of dates (must all share one year), one
 pass, one summary -- for small ad-hoc/live-validation checks.
 
 --year and --from/--to both process every calendar date in the requested
-span, sequentially, then immediately run a second full pass over the same
-dates to verify that already-complete/missing issues are skipped and
-nothing on disk changes. A span is grouped by calendar year internally so
-each date's log lines and registry entry always land in that date's own
-year's files (data/raw/skrip/<year>/issues_registry.json,
-logs/skrip/<year>.log) -- years are never mixed, even if a --from/--to
-span happened to cross a year boundary.
+span, sequentially, then immediately run a local, offline, read-only
+verification pass over the same dates (manifest/registry consistency, raw
+page and merged PDF sha256 checks, cross-issue contamination, duplicate
+merged PDFs) -- never a second real crawl. A span is grouped by calendar
+year internally so each date's log lines and registry entry always land in
+that date's own year's files (data/raw/skrip/<year>/issues_registry.json,
+logs/skrip/<year>.log) -- years are never mixed, even if a --from/--to span
+happened to cross a year boundary.
+
+--verify is a modifier: combined with --dates/--year/--from+--to, it skips
+the crawl entirely and only runs the offline verification pass described
+above. No network requests, no writes to manifest.json/issues_registry.json,
+not even a log file is created.
 """
 
 from __future__ import annotations
@@ -25,15 +32,9 @@ from collections import Counter
 from datetime import date, timedelta
 from typing import Any, Dict, List
 
-from . import config, registry
+from . import config, local_verify, registry
 from .logging_setup import setup_logger, log_event
 from .pipeline import process_date
-from .verification import (
-    diff_snapshots,
-    find_cross_contamination,
-    snapshot_merged_pdfs,
-    snapshot_raw_page_files,
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +60,13 @@ def parse_args() -> argparse.Namespace:
         "--to",
         dest="date_to",
         help="End date YYYY-MM-DD of a range, inclusive (must be used together with --from).",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Run ONLY local, offline verification over the selected dates -- no crawl, "
+             "no network calls, no writes to manifest.json or issues_registry.json. "
+             "Must be combined with --dates, --year, or --from/--to.",
     )
     args = parser.parse_args()
 
@@ -205,54 +213,29 @@ def print_directory_tree(year: int) -> None:
             print(f"  ... ({len(merged_files) - 5} more merged PDFs)")
 
 
-def run_crawl(dates: List[date], label: str) -> None:
-    """Shared two-pass (crawl + verify) driver behind both --year and
-    --from/--to. Groups dates by calendar year so every date's log lines
-    and registry entry go exclusively to that year's own files."""
+def run_crawl(dates: List[date], label: str, verify_only: bool = False) -> None:
+    """Driver behind --year and --from/--to: a real crawl pass (unless
+    verify_only) followed unconditionally by a local, offline, read-only
+    verification pass (skrip_downloader.local_verify) -- never a second real
+    crawl. Groups dates by calendar year so every date's log lines and
+    registry entry go exclusively to that year's own files."""
     groups = group_by_year(dates)
     years = sorted(groups)
-    loggers = {y: setup_logger(y) for y in years}
 
-    print(f"########## PASS 1: {label} ({len(dates)} dates across year(s) {years}) ##########")
-    results_pass1: Dict[str, Dict[str, Any]] = {}
-    for y in years:
-        results_pass1.update(run_dates(groups[y], loggers[y]))
-    summary1 = summarize(results_pass1)
-    print_summary(f"PASS 1 SUMMARY - {label}", summary1, years)
+    if not verify_only:
+        loggers = {y: setup_logger(y) for y in years}
+        print(f"########## CRAWL: {label} ({len(dates)} dates across year(s) {years}) ##########")
+        results: Dict[str, Dict[str, Any]] = {}
+        for y in years:
+            results.update(run_dates(groups[y], loggers[y]))
+        summary = summarize(results)
+        print_summary(f"CRAWL SUMMARY - {label}", summary, years)
+    else:
+        print(f"########## VERIFY ONLY (offline, no crawl, no network, no writes): "
+              f"{label} ({len(dates)} dates across year(s) {years}) ##########")
 
-    violations: List[str] = []
-    for y in years:
-        violations.extend(find_cross_contamination(y))
-    print(f"\nCross-contamination check: {'CLEAN' if not violations else 'VIOLATIONS FOUND'}")
-    for v in violations:
-        print(f"  VIOLATION: {v}")
-
-    merged_before = {y: snapshot_merged_pdfs(y) for y in years}
-    pages_before = {y: snapshot_raw_page_files(y) for y in years}
-
-    print(f"\n########## PASS 2: verification re-run - {label} ##########")
-    results_pass2: Dict[str, Dict[str, Any]] = {}
-    for y in years:
-        results_pass2.update(run_dates(groups[y], loggers[y]))
-    summary2 = summarize(results_pass2)
-    print_summary(f"PASS 2 SUMMARY - {label}", summary2, years)
-
-    print("\n===== PASS 2 IDEMPOTENCY VERIFICATION =====")
-    idempotent_all = True
-    for y in years:
-        merged_diff = diff_snapshots(merged_before[y], snapshot_merged_pdfs(y))
-        pages_diff = diff_snapshots(pages_before[y], snapshot_raw_page_files(y))
-        print(f"-- Year {y} --")
-        print(f"  Merged PDFs added:   {merged_diff['added'] or 'none'}")
-        print(f"  Merged PDFs removed: {merged_diff['removed'] or 'none'}")
-        print(f"  Merged PDFs changed (sha256/bytes differ): {merged_diff['changed'] or 'none'}")
-        print(f"  Raw page files added/removed/changed: "
-              f"{len(pages_diff['added'])}/{len(pages_diff['removed'])}/{len(pages_diff['changed'])}")
-        if any(merged_diff["added"] or merged_diff["removed"] or merged_diff["changed"]
-               or pages_diff["added"] or pages_diff["removed"] or pages_diff["changed"]):
-            idempotent_all = False
-
-    print(f"\nIDEMPOTENT SECOND RUN: {'YES' if idempotent_all else 'NO -- INVESTIGATE'}")
+    report = local_verify.run_local_verification(groups)
+    local_verify.print_verification_report(report, years)
 
     for y in years:
         print_directory_tree(y)
@@ -263,25 +246,36 @@ def main() -> None:
     args = parse_args()
 
     if args.year is not None:
-        run_crawl(year_dates(args.year), label=f"full-year crawl for {args.year}")
+        mode = "verify" if args.verify else "crawl"
+        run_crawl(year_dates(args.year), label=f"full-year {mode} for {args.year}", verify_only=args.verify)
         return
 
     if args.date_from:
         date_from = date.fromisoformat(args.date_from)
         date_to = date.fromisoformat(args.date_to)
         dates = dates_in_range(date_from, date_to)
-        run_crawl(dates, label=f"date-range crawl {date_from.isoformat()} -> {date_to.isoformat()}")
+        mode = "verify" if args.verify else "crawl"
+        run_crawl(
+            dates,
+            label=f"date-range {mode} {date_from.isoformat()} -> {date_to.isoformat()}",
+            verify_only=args.verify,
+        )
         return
 
-    # --dates: single explicit list, single pass, single year (original behavior).
-    dates = [date.fromisoformat(d) for d in args.dates]
+    # --dates: explicit list, must all share one year.
+    dates = sorted(date.fromisoformat(d) for d in args.dates)
     years = {d.year for d in dates}
     if len(years) != 1:
         raise SystemExit("All --dates must be within the same year for a single run.")
     year = years.pop()
 
+    if args.verify:
+        run_crawl(dates, label=f"explicit-dates verify ({year})", verify_only=True)
+        return
+
+    # Original, untouched single-pass behavior -- no auto-verify, ever.
     logger = setup_logger(year)
-    results = run_dates(sorted(dates), logger)
+    results = run_dates(dates, logger)
     summary = summarize(results)
     print_summary(f"SUMMARY - {year}", summary, [year])
 
