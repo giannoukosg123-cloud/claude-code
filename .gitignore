@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 data/
 logs/
+akropolis_downloader/recon_viewer.html
+akropolis_downloader/recon_frame_*.html
+akropolis_downloader/recon_network_log.jsonl
