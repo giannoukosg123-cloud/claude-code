@@ -37,6 +37,11 @@ from .validation import sha256_of_file, validate_pdf_file
 START_POSITION = 155
 END_POSITION = 170  # inclusive
 
+# This diagnostic tool only ever operates on the original default record
+# (item=40489, seg=7597) -- unaffected by any other record added to
+# config.RECORDS later.
+RECORD = config.DEFAULT_RECORD
+
 DIAGNOSTIC_DIR = config.REPO_ROOT / "diagnostic" / f"positions_{START_POSITION}_{END_POSITION}"
 DIAGNOSTIC_JSON_PATH = DIAGNOSTIC_DIR / f"diagnostic_positions_{START_POSITION}_{END_POSITION}.json"
 
@@ -47,7 +52,7 @@ def diag_filename(logical_position: int, current_id: int) -> str:
 
 def download_one(session, entry: discovery.DiscoveredEntry, referer: str, logger) -> Dict[str, Any]:
     local_path = DIAGNOSTIC_DIR / diag_filename(entry.logical_position, entry.current_id)
-    record: Dict[str, Any] = {
+    result: Dict[str, Any] = {
         "logical_position": entry.logical_position,
         "current_id": entry.current_id,
         "source_url": discovery.main_url(entry.current_id),
@@ -58,16 +63,16 @@ def download_one(session, entry: discovery.DiscoveredEntry, referer: str, logger
     }
 
     response = http_client.get_with_retry(
-        session, record["source_url"], logger=logger, log_label="main.asp-diagnostic", stream=True, referer=referer,
+        session, result["source_url"], logger=logger, log_label="main.asp-diagnostic", stream=True, referer=referer,
     )
     if response.status_code != 200:
-        record["validation_status"] = f"error_http_{response.status_code}"
+        result["validation_status"] = f"error_http_{response.status_code}"
         log_event(
-            logger, logical_position=entry.logical_position, current_id=entry.current_id,
-            action="DIAGNOSTIC_DOWNLOAD_FAIL", source_url=record["source_url"], local_path=str(local_path),
+            logger, RECORD, logical_position=entry.logical_position, current_id=entry.current_id,
+            action="DIAGNOSTIC_DOWNLOAD_FAIL", source_url=result["source_url"], local_path=str(local_path),
             status="error", extra=f"http_status={response.status_code}",
         )
-        return record
+        return result
 
     DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=str(DIAGNOSTIC_DIR), prefix=".dl_", suffix=".part")
@@ -83,33 +88,33 @@ def download_one(session, entry: discovery.DiscoveredEntry, referer: str, logger
         raise
 
     check = validate_pdf_file(local_path)
-    record["bytes"] = check.size_bytes
+    result["bytes"] = check.size_bytes
     if check.ok:
-        record["sha256"] = check.sha256
-        record["validation_status"] = "ok"
+        result["sha256"] = check.sha256
+        result["validation_status"] = "ok"
         log_event(
-            logger, logical_position=entry.logical_position, current_id=entry.current_id,
-            action="DIAGNOSTIC_DOWNLOAD_OK", source_url=record["source_url"], local_path=str(local_path),
+            logger, RECORD, logical_position=entry.logical_position, current_id=entry.current_id,
+            action="DIAGNOSTIC_DOWNLOAD_OK", source_url=result["source_url"], local_path=str(local_path),
             status="ok", extra=f"bytes={check.size_bytes} sha256={check.sha256} pages={check.page_count}",
         )
     else:
-        record["validation_status"] = f"error_{check.error}"
+        result["validation_status"] = f"error_{check.error}"
         log_event(
-            logger, logical_position=entry.logical_position, current_id=entry.current_id,
-            action="DIAGNOSTIC_VALIDATE_FAIL", source_url=record["source_url"], local_path=str(local_path),
+            logger, RECORD, logical_position=entry.logical_position, current_id=entry.current_id,
+            action="DIAGNOSTIC_VALIDATE_FAIL", source_url=result["source_url"], local_path=str(local_path),
             status="error", extra=f"error={check.error}",
         )
 
-    return record
+    return result
 
 
 def main() -> None:
-    logger = setup_logger()
+    logger = setup_logger(RECORD)
     session = http_client.new_session()
 
     print("########## DISCOVERY (using the existing verified header.asp mapping) ##########")
     try:
-        entries, strategy, header_url = pipeline.run_discovery(session, logger)
+        entries, strategy, header_url = pipeline.run_discovery(session, RECORD, logger)
     except pipeline.DiscoveryError as exc:
         print("\nDISCOVERY FAILED -- stopping before any diagnostic download:")
         print(str(exc))

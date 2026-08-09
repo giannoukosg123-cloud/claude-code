@@ -54,6 +54,10 @@ from pypdf import PdfReader
 from . import config, http_client
 from .discovery import display_doc_url, library_url, main_url
 
+# This recon tool only ever operates on the original default record
+# (item=40489, seg=7597).
+RECORD = config.DEFAULT_RECORD
+
 HERE = Path(__file__).resolve().parent
 OUT_DIR = HERE.parent / "recon_output"
 
@@ -102,7 +106,7 @@ def _context(text: str, start: int, end: int, radius: int = 50) -> str:
 
 
 def scan_html(html: str, label: str) -> Dict[str, Any]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
     hidden_inputs = [
         {"name": t.get("name"), "value": t.get("value")}
@@ -168,7 +172,7 @@ def strip_select_blocks(html: str) -> str:
     """Remove the big 546-option page-selector <select> so the remaining
     text can be diffed across the 5 fetches without the expected
     <option selected> shift drowning out anything actually interesting."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     for sel in soup.find_all("select"):
         sel.decompose()
     return soup.get_text(separator=" | ", strip=True)
@@ -190,20 +194,20 @@ def main() -> None:
     all_scan_results: List[Dict[str, Any]] = []
 
     print("########## SHARED PAGES (fetched once) ##########")
-    lib_resp = http_client.get_with_retry(session, library_url(), logger=logger, log_label="library.asp")
+    lib_resp = http_client.get_with_retry(session, library_url(RECORD), logger=logger, log_label="library.asp")
     print(f"library.asp -> HTTP {lib_resp.status_code}")
     r = scan_html(safe_text(lib_resp), "library.asp?item=40489")
     print_scan_result(r)
     all_scan_results.append(r)
 
-    lib_seg_url = f"{library_url()}&seg={config.SEG}"
+    lib_seg_url = f"{library_url(RECORD)}&seg={RECORD.seg}"
     lib_seg_resp = http_client.get_with_retry(session, lib_seg_url, logger=logger, log_label="library.asp+seg")
     print(f"\nlibrary.asp?item=40489&seg=7597 -> HTTP {lib_seg_resp.status_code}")
     r = scan_html(safe_text(lib_seg_resp), "library.asp?item=40489&seg=7597")
     print_scan_result(r)
     all_scan_results.append(r)
 
-    doc_resp = http_client.get_with_retry(session, display_doc_url(), logger=logger, log_label="display_doc.asp")
+    doc_resp = http_client.get_with_retry(session, display_doc_url(RECORD), logger=logger, log_label="display_doc.asp")
     print(f"\ndisplay_doc.asp -> HTTP {doc_resp.status_code}")
     r = scan_html(safe_text(doc_resp), "display_doc.asp?item=40489&seg=7597")
     print_scan_result(r)
@@ -215,7 +219,7 @@ def main() -> None:
         cid = scan["current_id"]
         url = header_url_for(cid)
         resp = http_client.get_with_retry(session, url, logger=logger, log_label="header.asp+current",
-                                           referer=display_doc_url())
+                                           referer=display_doc_url(RECORD))
         print(f"\nheader.asp current={cid} (pos={scan['logical_position']}) -> HTTP {resp.status_code}")
         r = scan_html(safe_text(resp), f"header.asp current={cid} (pos={scan['logical_position']})")
         print_scan_result(r)

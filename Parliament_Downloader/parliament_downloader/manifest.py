@@ -1,4 +1,6 @@
-"""manifest.json read/write for this one item/segment record."""
+"""manifest.json read/write, parameterized by which item/segment Record
+is being processed -- each record's manifest lives at its own
+record.manifest_path, fully isolated from every other record."""
 
 from __future__ import annotations
 
@@ -10,28 +12,28 @@ from typing import Any, Dict, List, Optional
 from . import config
 
 
-def new_manifest(discovered_scans: int) -> Dict[str, Any]:
+def new_manifest(record: config.Record, discovered_scans: int) -> Dict[str, Any]:
     return {
-        "item_id": config.ITEM,
-        "segment_id": config.SEG,
-        "title": config.TITLE,
-        "segment_label": config.SEGMENT_LABEL,
-        "expected_scans": config.EXPECTED_SCANS,
+        "item_id": record.item,
+        "segment_id": record.seg,
+        "title": record.title,
+        "segment_label": record.segment_label,
+        "expected_scans": record.expected_scans,
         "discovered_scans": discovered_scans,
         "scans": [],
     }
 
 
-def scan_filename(logical_position: int, current_id: int) -> str:
-    return f"AKROPOLIS_item{config.ITEM}_seg{config.SEG}_scan_{logical_position:04d}_current_{current_id}.pdf"
+def scan_filename(record: config.Record, logical_position: int, current_id: int) -> str:
+    return f"AKROPOLIS_item{record.item}_seg{record.seg}_scan_{logical_position:04d}_current_{current_id}.pdf"
 
 
-def new_scan_entry(logical_position: int, current_id: int, source_url: str) -> Dict[str, Any]:
+def new_scan_entry(record: config.Record, logical_position: int, current_id: int, source_url: str) -> Dict[str, Any]:
     return {
         "logical_position": logical_position,
         "current_id": current_id,
         "source_url": source_url,
-        "local_filename": scan_filename(logical_position, current_id),
+        "local_filename": scan_filename(record, logical_position, current_id),
         "bytes": None,
         "sha256": None,
         "pdf_page_count": None,
@@ -40,9 +42,9 @@ def new_scan_entry(logical_position: int, current_id: int, source_url: str) -> D
     }
 
 
-def save_manifest(data: Dict[str, Any]) -> None:
+def save_manifest(record: config.Record, data: Dict[str, Any]) -> None:
     data["scans"] = sorted(data["scans"], key=lambda s: s["logical_position"])
-    path = config.MANIFEST_PATH
+    path = record.manifest_path
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=".manifest_", suffix=".json.tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -50,8 +52,8 @@ def save_manifest(data: Dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def load_manifest() -> Optional[Dict[str, Any]]:
-    path = config.MANIFEST_PATH
+def load_manifest(record: config.Record) -> Optional[Dict[str, Any]]:
+    path = record.manifest_path
     if not path.exists():
         return None
     with open(path, "r", encoding="utf-8") as f:

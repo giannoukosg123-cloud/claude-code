@@ -38,6 +38,16 @@ from bs4 import BeautifulSoup
 from . import config
 from .http_client import get_with_retry
 
+# MUST be "lxml", not "html.parser": Python's built-in html.parser does not
+# implement the HTML5 spec's "historical reasons" carve-out for legacy
+# named character references inside attribute values, and silently
+# corrupts any unescaped "&current=..." in an attribute (e.g. a frame's
+# src="header.asp?...&current=123") into "...¤t=123" by decoding "&curren"
+# as the U+00A4 currency-sign entity. lxml (and real browsers) correctly
+# leave it alone. Confirmed via: BeautifulSoup('<a href="x?a=1&current=2">',
+# "html.parser").a["href"] -> 'x?a=1¤t=2' (wrong) vs "lxml" -> unchanged.
+BS_PARSER = "lxml"
+
 CURRENT_RE = re.compile(r"current=(\d+)")
 JS_ARRAY_RE = re.compile(r"\[\s*(\d+)\s*\]\s*=\s*[\"']([^\"']*current=(\d+)[^\"']*)[\"']")
 
@@ -49,36 +59,40 @@ class DiscoveredEntry:
     source_url: str
 
 
-def library_url() -> str:
-    return f"{config.BASE_URL}{config.LIBRARY_PATH}?item={config.ITEM}"
+def library_url(record: config.Record) -> str:
+    return f"{config.BASE_URL}{config.LIBRARY_PATH}?item={record.item}"
 
 
-def display_doc_url() -> str:
-    return f"{config.BASE_URL}{config.DISPLAY_DOC_PATH}?item={config.ITEM}&seg={config.SEG}"
+def display_doc_url(record: config.Record) -> str:
+    return f"{config.BASE_URL}{config.DISPLAY_DOC_PATH}?item={record.item}&seg={record.seg}"
 
 
 def main_url(current_id: int) -> str:
+    """No record needed -- main.asp?current=ID is self-contained regardless
+    of which item/segment the ID came from."""
     return f"{config.BASE_URL}{config.MAIN_PATH}?current={current_id}"
 
 
-def fetch_library(session: requests.Session, logger: logging.Logger) -> requests.Response:
-    return get_with_retry(session, library_url(), logger=logger, log_label="library.asp")
+def fetch_library(session: requests.Session, record: config.Record, logger: logging.Logger) -> requests.Response:
+    return get_with_retry(session, library_url(record), logger=logger, log_label="library.asp")
 
 
-def confirm_segment_present(html: str) -> bool:
+def confirm_segment_present(html: str, record: config.Record) -> bool:
     """Both the seg id and the human-readable segment label should appear
     somewhere on library.asp -- if not, we may be looking at the wrong
     item/segment entirely."""
-    return f"seg={config.SEG}" in html or str(config.SEG) in html
+    return f"seg={record.seg}" in html or str(record.seg) in html
 
 
-def fetch_display_doc(session: requests.Session, logger: logging.Logger) -> requests.Response:
-    return get_with_retry(session, display_doc_url(), logger=logger, log_label="display_doc.asp", referer=library_url())
+def fetch_display_doc(session: requests.Session, record: config.Record, logger: logging.Logger) -> requests.Response:
+    return get_with_retry(
+        session, display_doc_url(record), logger=logger, log_label="display_doc.asp", referer=library_url(record),
+    )
 
 
 def find_header_url(display_doc_html: str, base_url: str) -> Optional[str]:
     """The frameset's header frame's src, resolved to an absolute URL."""
-    soup = BeautifulSoup(display_doc_html, "html.parser")
+    soup = BeautifulSoup(display_doc_html, BS_PARSER)
     for tag in soup.find_all(["frame", "iframe"]):
         src = tag.get("src", "")
         if "header.asp" in src.lower():
@@ -86,12 +100,14 @@ def find_header_url(display_doc_html: str, base_url: str) -> Optional[str]:
     return None
 
 
-def fetch_header(session: requests.Session, header_url: str, logger: logging.Logger) -> requests.Response:
-    return get_with_retry(session, header_url, logger=logger, log_label="header.asp", referer=display_doc_url())
+def fetch_header(
+    session: requests.Session, header_url: str, record: config.Record, logger: logging.Logger,
+) -> requests.Response:
+    return get_with_retry(session, header_url, logger=logger, log_label="header.asp", referer=display_doc_url(record))
 
 
 def _parse_via_options(html: str, logger: logging.Logger) -> List[DiscoveredEntry]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, BS_PARSER)
     entries: List[DiscoveredEntry] = []
     for i, opt in enumerate(soup.find_all("option"), start=1):
         value = opt.get("value", "")

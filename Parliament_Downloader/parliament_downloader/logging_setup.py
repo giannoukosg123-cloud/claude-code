@@ -1,6 +1,13 @@
 """Logging helpers. Independent from skrip_downloader's (deliberately not
 shared/imported) but the same spirit: every scan-relevant log line carries
-enough fields to reconstruct exactly what happened without guessing."""
+enough fields to reconstruct exactly what happened without guessing.
+
+Each Record gets its own logger instance (keyed by item/seg), so two
+different segments processed in the same process can never end up writing
+into each other's log file -- logging.getLogger() returns the SAME
+singleton for a given name, so a shared/fixed logger name would have
+leaked one segment's log lines into another's file the moment a second
+record was ever used."""
 
 from __future__ import annotations
 
@@ -11,17 +18,17 @@ from typing import Optional
 from . import config
 
 
-def setup_logger() -> logging.Logger:
+def setup_logger(record: config.Record) -> logging.Logger:
     config.LOG_ROOT.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("parliament_downloader")
+    logger = logging.getLogger(f"parliament_downloader.item{record.item}.seg{record.seg}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
     if not logger.handlers:
         formatter = logging.Formatter("%(message)s")
 
-        file_handler = logging.FileHandler(config.LOG_PATH, encoding="utf-8")
+        file_handler = logging.FileHandler(record.log_path, encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
@@ -34,6 +41,7 @@ def setup_logger() -> logging.Logger:
 
 def log_event(
     logger: logging.Logger,
+    record: config.Record,
     *,
     logical_position: Optional[int],
     current_id: Optional[int],
@@ -46,8 +54,8 @@ def log_event(
     ts = datetime.now(timezone.utc).isoformat()
     fields = [
         ts,
-        f"item={config.ITEM}",
-        f"seg={config.SEG}",
+        f"item={record.item}",
+        f"seg={record.seg}",
         f"pos={logical_position if logical_position is not None else '-'}",
         f"current={current_id if current_id is not None else '-'}",
         action,
