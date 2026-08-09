@@ -42,7 +42,23 @@ itself is now made immune to it: any response is rejected outright (never
 silently accepted) if its URL starts with "chrome-extension://", or if its
 body is smaller than MIN_VALID_PDF_BYTES -- real scanned pages are ~1-2MB,
 so anything under that bar is refused as a placeholder and the wait
-continues for a real candidate. See wait_for_real_pdf().
+continues for a real candidate. See wait_for_real_pdf() -- this filtering
+logic is confirmed correct and untouched by the change below.
+
+A manual test then found the REAL navigation control: the frameset is
+rows="45,81%,43" (top=header.asp, middle=main.asp, bottom=footer.asp), and
+the "Μετάβαση σε σελίδα" page-number dropdown lives in the TOP (header.asp)
+frame, not anywhere inside the main.asp content frame. Manually changing
+that dropdown's value (12 -> 13) genuinely navigated to different content
+(verified visually). So the real mechanism (Method C, now primary) is:
+find the header.asp frame, find its page-number <select>, and
+select_option() a target page number there -- letting the site's own
+onchange handler do the real navigation (almost certainly straight to that
+option's own main.asp?current=... value, which is why arithmetic
+current-id guessing was always the wrong approach). The old Method A
+(direct main_frame.goto) and Method B (guessing a "next" click target
+inside main.asp) are kept only as a fallback if no header.asp frame or no
+plausible page-number <select> is found.
 
 Usage:
     pip install playwright
@@ -171,6 +187,88 @@ def try_click_first(target, selectors: list[str], label: str) -> bool:
 
 def find_main_frame(page):
     return next((f for f in page.frames if "main.asp" in f.url), None)
+
+
+def find_header_frame(page):
+    return next((f for f in page.frames if "header.asp" in f.url), None)
+
+
+def find_page_number_select(frame):
+    """Return (locator, options) for the <select> most likely to be the
+    real 'Μετάβαση σε σελίδα' page-number dropdown confirmed to live in the
+    header.asp frame: the one with the most purely-numeric option texts.
+    options is a list of {"value", "text", "selected"} dicts. Returns
+    (None, []) if nothing plausible is found."""
+    try:
+        selects = frame.locator("select").all()
+    except Exception as exc:  # noqa: BLE001
+        print(f"    could not query <select> in header frame: {exc}")
+        return None, []
+
+    best = None
+    best_options: list[dict] = []
+    best_numeric_count = 0
+    for idx, sel_el in enumerate(selects):
+        try:
+            opts = sel_el.locator("option").all()
+        except Exception:  # noqa: BLE001
+            continue
+        options = []
+        numeric_count = 0
+        for opt in opts:
+            value = opt.get_attribute("value")
+            text = opt.inner_text().strip()
+            selected = opt.get_attribute("selected") is not None
+            options.append({"value": value, "text": text, "selected": selected})
+            if text.isdigit():
+                numeric_count += 1
+        print(f"    header <select> #{idx}: {len(options)} options, {numeric_count} purely numeric")
+        if numeric_count > best_numeric_count:
+            best_numeric_count = numeric_count
+            best = sel_el
+            best_options = options
+
+    if best is not None and best_numeric_count >= 2:
+        return best, best_options
+    return None, []
+
+
+def determine_start_page(options: list[dict]) -> int:
+    for o in options:
+        if o["selected"] and o["text"].isdigit():
+            return int(o["text"])
+    if options and options[0]["text"].isdigit():
+        return int(options[0]["text"])
+    return 1
+
+
+def lookup_current_id_for_page(options: list[dict], target_page: int) -> "int | None":
+    target_text = str(target_page)
+    match = next((o for o in options if o["text"] == target_text), None)
+    if match and match["value"]:
+        m = CURRENT_RE.search(match["value"])
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def select_page(select_locator, options: list[dict], target_page: int) -> None:
+    """Trigger function for wait_for_real_pdf: select_option() the option
+    whose visible text is exactly target_page's number. Its value almost
+    certainly already IS main.asp?current=... -- we don't need to know
+    or guess the current_id ourselves, the site's own onchange handler
+    does the real navigation."""
+    target_text = str(target_page)
+    match = next((o for o in options if o["text"] == target_text), None)
+    if match is None:
+        raise RuntimeError(f"page {target_page} not present among header <select> options")
+    if match["value"]:
+        try:
+            select_locator.select_option(value=match["value"])
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    select_locator.select_option(label=target_text)
 
 
 def dump_forms_and_selects(page) -> None:
@@ -384,51 +482,96 @@ def main() -> None:
         print(f"[5] main.asp frame found "
               f"{'in the new tab/window' if new_page is not None else 'on the original page'}: {main_frame.url}")
 
-        for i in range(N_TEST_PAGES):
-            target_current = FIRST_CURRENT_ID + i
-            new_url = CURRENT_RE.sub(f"current={target_current}", main_frame.url)
-            print(f"\n[page {i + 1}/{N_TEST_PAGES}] target current={target_current}")
+        header_frame = find_header_frame(viewer_page)
+        page_select, select_options, start_page = None, [], None
+        if header_frame:
+            print(f"[5b] header.asp frame found: {header_frame.url}")
+            page_select, select_options = find_page_number_select(header_frame)
+            if page_select is not None:
+                preview = (
+                    select_options[:10] + [{"...": f"{len(select_options) - 15} more"}] + select_options[-5:]
+                    if len(select_options) > 15 else select_options
+                )
+                print(f"    Confirmed page-number <select> with {len(select_options)} options. "
+                      f"Preview: {preview}")
+                start_page = determine_start_page(select_options)
+                print(f"    Determined starting page number: {start_page}")
+            else:
+                print("    No <select> in the header frame looked like a page-number dropdown "
+                      "(needed >=2 purely-numeric options). Falling back to Method A/B.")
+        else:
+            print("[5b] WARNING: no frame with 'header.asp' in its URL was found -- cannot use the "
+                  "confirmed dropdown-based navigation. Falling back to Method A/B (unconfirmed).")
 
+        for i in range(N_TEST_PAGES):
             pdf_response = None
             body = None
+            current_id_for_manifest = None
 
-            # --- Method A: direct frame URL navigation, no click at all. ---
-            print(f"    Method A: navigating main frame directly to {new_url}")
-            pdf_response, body = wait_for_real_pdf(
-                viewer_page,
-                lambda u=new_url: main_frame.goto(u, wait_until="commit", timeout=PDF_WAIT_TIMEOUT_MS),
-                PDF_WAIT_TIMEOUT_MS,
-                "Method A",
-            )
-            if pdf_response is not None:
-                if method_used is None:
-                    method_used = "A (direct frame URL navigation, no click)"
-                print(f"    Method A worked -- real application/pdf response: {pdf_response.url} ({len(body)} bytes)")
-            else:
-                print("    Method A: no valid (non-placeholder, non-extension) application/pdf response within timeout.")
+            if page_select is not None and start_page is not None:
+                # --- Method C (confirmed, primary): select_option() on the
+                # header.asp frame's page-number dropdown. ---
+                target_page = start_page + i
+                current_id_for_manifest = lookup_current_id_for_page(select_options, target_page)
+                print(f"\n[page {i + 1}/{N_TEST_PAGES}] target page number={target_page} "
+                      f"(via header <select>; current_id from option value: {current_id_for_manifest})")
 
-            # --- Method B: click a real 'next page' control. ---
-            if pdf_response is None:
-                print("    Trying Method B: clicking a 'next page' control ...")
-                dump_next_page_candidates(main_frame)
-
-                def click_next(i=i):
-                    if not try_click_first(main_frame, NEXT_PAGE_SELECTORS, f"next-page-{i + 1}"):
-                        raise RuntimeError("no guessed selector matched any element")
-
-                pdf_response, body = wait_for_real_pdf(viewer_page, click_next, PDF_WAIT_TIMEOUT_MS, "Method B")
+                pdf_response, body = wait_for_real_pdf(
+                    viewer_page,
+                    lambda tp=target_page: select_page(page_select, select_options, tp),
+                    PDF_WAIT_TIMEOUT_MS,
+                    "Method C",
+                )
                 if pdf_response is not None:
                     if method_used is None:
-                        method_used = "B (clicking a next-page control)"
-                    print(f"    Method B worked -- real application/pdf response: {pdf_response.url} ({len(body)} bytes)")
+                        method_used = "C (select_option on header.asp's page-number dropdown)"
+                    print(f"    Method C worked -- real application/pdf response: {pdf_response.url} ({len(body)} bytes)")
                 else:
-                    print(f"    Method B also failed for current={target_current}.")
+                    print(f"    Method C: no valid application/pdf response within timeout for page {target_page}.")
                     print("    Skipping this page -- see rejected-candidate lines above and recon_network_log.jsonl.")
                     continue
+            else:
+                # --- Fallback: old, unconfirmed Method A/B by current-id increment. ---
+                target_current = FIRST_CURRENT_ID + i
+                current_id_for_manifest = target_current
+                new_url = CURRENT_RE.sub(f"current={target_current}", main_frame.url)
+                print(f"\n[page {i + 1}/{N_TEST_PAGES}] target current={target_current} (fallback path)")
+
+                print(f"    Method A: navigating main frame directly to {new_url}")
+                pdf_response, body = wait_for_real_pdf(
+                    viewer_page,
+                    lambda u=new_url: main_frame.goto(u, wait_until="commit", timeout=PDF_WAIT_TIMEOUT_MS),
+                    PDF_WAIT_TIMEOUT_MS,
+                    "Method A",
+                )
+                if pdf_response is not None:
+                    if method_used is None:
+                        method_used = "A (direct frame URL navigation, no click)"
+                    print(f"    Method A worked -- real application/pdf response: {pdf_response.url} ({len(body)} bytes)")
+                else:
+                    print("    Method A: no valid (non-placeholder, non-extension) application/pdf response within timeout.")
+
+                if pdf_response is None:
+                    print("    Trying Method B: clicking a 'next page' control ...")
+                    dump_next_page_candidates(main_frame)
+
+                    def click_next(i=i):
+                        if not try_click_first(main_frame, NEXT_PAGE_SELECTORS, f"next-page-{i + 1}"):
+                            raise RuntimeError("no guessed selector matched any element")
+
+                    pdf_response, body = wait_for_real_pdf(viewer_page, click_next, PDF_WAIT_TIMEOUT_MS, "Method B")
+                    if pdf_response is not None:
+                        if method_used is None:
+                            method_used = "B (clicking a next-page control)"
+                        print(f"    Method B worked -- real application/pdf response: {pdf_response.url} ({len(body)} bytes)")
+                    else:
+                        print(f"    Method B also failed for current={target_current}.")
+                        print("    Skipping this page -- see rejected-candidate lines above and recon_network_log.jsonl.")
+                        continue
 
             captured_pages.append({
                 "sequence_number": len(captured_pages) + 1,
-                "current_id": target_current,
+                "current_id": current_id_for_manifest,
                 "source_url": pdf_response.url,
                 "content_type": pdf_response.headers.get("content-type", ""),
                 "bytes_data": body,
