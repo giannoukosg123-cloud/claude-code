@@ -1,17 +1,35 @@
-"""AKROPOLIS microfilm reconnaissance -- Phase 1 (EXPLORATORY, not validated).
+"""AKROPOLIS microfilm reconnaissance -- Phase 1, continued (EXPLORATORY).
 
 Independent tool. Nothing here is shared with skrip_downloader (different
 site, different site logic: digitallib.parliament.gr vs efimeris.nlg.gr).
 
-Investigates how digitallib.parliament.gr serves individual microfilm page
-images/PDFs for item=40482 (ΑΚΡΟΠΟΛΙΣ, Jul-Sep 1935, 456 pages total). The
-selectors below ("Μετάβαση" link, "next page" control) are best-effort
-guesses based on the task description, NOT confirmed against live markup --
-this environment has no network access to digitallib.parliament.gr to
-verify them. Run this locally with HEADLESS=0 the first time so you can see
-exactly what happens and fix any selector that doesn't match, using the
-dumped recon_viewer.html / recon_frame_*.html / recon_network_log.jsonl as
-evidence.
+Confirmed so far from a local run (this sandbox's network egress policy
+blocks digitallib.parliament.gr, so none of this has been reproduced here):
+
+  - Viewer: display_doc.asp?item=40482&seg=... loads a frameset
+    (top=header.asp, middle=main.asp, bottom=footer.asp).
+  - Page navigation happens via the middle frame's URL: main.asp?current={N}
+    (sequential integers; first page seen so far: current=7154207).
+  - Images/MICROFILMS/low/{N}.jpg is a low-res thumbnail ONLY -- it doesn't
+    even work as a direct HTTP request outside the browser session (returns
+    the site's logo), and is NOT the real page content.
+  - The real page content is a ~1-2MB application/pdf response with a
+    random/UUID-style filename, fired with Initiator = main.asp?current=...
+    -- NOT a predictable URL. It must be captured via network interception,
+    once per page, keyed by *which current= value was active when it fired*
+    (not by parsing the PDF response's own URL, which carries no page info).
+
+This script now filters exclusively on Content-Type: application/pdf (never
+images/CSS/JS) and tries two navigation strategies per page, to determine
+which one reliably triggers that PDF request:
+
+  A) Direct URL navigation: set the middle (main.asp) frame's own URL to
+     main.asp?current={N+1} and see if that alone fires the PDF request --
+     no button click at all.
+  B) Fallback: click a real "next page" control inside that frame. The
+     exact selector is NOT confirmed against live markup, so this also
+     dumps every element with an onclick mentioning "current" as a
+     diagnostic in case the guessed selectors below don't match.
 
 Usage:
     pip install playwright
@@ -27,7 +45,7 @@ import os
 import re
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 ITEM = 40482
 LIBRARY_URL = f"http://digitallib.parliament.gr/library.asp?item={ITEM}"
@@ -43,33 +61,33 @@ HEADLESS = os.environ.get("HEADLESS", "1") != "0"
 # match the installed `playwright` pip package's expected version (Playwright
 # will tell you loudly if so). Leave unset normally.
 CHROMIUM_EXECUTABLE_PATH = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH") or None
+
+# The first current= value seen so far. Override via env var if a fresh
+# session starts elsewhere.
+FIRST_CURRENT_ID = int(os.environ.get("AKROPOLIS_FIRST_CURRENT", "7154207"))
 N_TEST_PAGES = 5
+PDF_WAIT_TIMEOUT_MS = 20000
+SMALL_FILE_WARNING_BYTES = 100_000  # a real scanned page should be well over this
 
 CURRENT_RE = re.compile(r"current=(\d+)")
 
-CONTENT_TYPE_EXT = {
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/png": ".png",
-    "image/tiff": ".tif",
-    "image/gif": ".gif",
-    "application/pdf": ".pdf",
-}
+NEXT_PAGE_SELECTORS = [
+    "a:has-text('▶')",
+    "a:has-text('>')",
+    "img[alt*='next' i]",
+    "img[alt*='επόμεν' i]",
+    "[title*='επόμεν' i]",
+    "[title*='next' i]",
+    "input[type=image]",
+]
 
 
-def is_page_image_response(content_type: str, url: str) -> bool:
-    ct = (content_type or "").split(";")[0].strip().lower()
-    if ct in CONTENT_TYPE_EXT:
-        return True
-    return bool(re.search(r"\.(jpe?g|png|tiff?|gif|pdf)(\?|$)", url, re.IGNORECASE))
-
-
-def ext_for(content_type: str, url: str) -> str:
-    ct = (content_type or "").split(";")[0].strip().lower()
-    if ct in CONTENT_TYPE_EXT:
-        return CONTENT_TYPE_EXT[ct]
-    m = re.search(r"\.(jpe?g|png|tiff?|gif|pdf)(\?|$)", url, re.IGNORECASE)
-    return f".{m.group(1).lower()}" if m else ".bin"
+def is_pdf_response(response) -> bool:
+    try:
+        content_type = response.headers.get("content-type", "")
+    except Exception:  # noqa: BLE001
+        return False
+    return content_type.split(";")[0].strip().lower() == "application/pdf"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -89,178 +107,199 @@ def try_click_first(target, selectors: list[str], label: str) -> bool:
     return False
 
 
+def find_main_frame(page):
+    return next((f for f in page.frames if "main.asp" in f.url), None)
+
+
+def dump_next_page_candidates(frame) -> None:
+    """Diagnostic only: elements whose onclick mentions 'current' are the
+    most likely real 'next page' control if the guessed selectors above
+    don't match live markup."""
+    print("    Elements with onclick mentioning 'current' (likely 'next page' candidates):")
+    try:
+        elements = frame.locator("[onclick]").all()
+    except Exception as exc:  # noqa: BLE001
+        print(f"    could not query onclick elements: {exc}")
+        return
+    found = 0
+    for el in elements:
+        try:
+            onclick = el.get_attribute("onclick") or ""
+        except Exception:  # noqa: BLE001
+            continue
+        if "current" in onclick.lower():
+            found += 1
+            try:
+                tag = el.evaluate("e => e.tagName")
+            except Exception:  # noqa: BLE001
+                tag = "?"
+            print(f"      <{tag} onclick=\"{onclick}\">")
+    if not found:
+        print("      (none found -- the real control may not use onclick at all, e.g. a plain <a href>)")
+
+
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     all_responses: list[dict] = []
-    candidate_pages: list[dict] = []  # in first-seen order: {url, content_type, bytes}
+    captured_pages: list[dict] = []  # {sequence_number, current_id, source_url, content_type, bytes_data}
+    method_used = None
+
+    netlog = open(NETWORK_LOG_PATH, "w", encoding="utf-8")
+
+    def log_all(response) -> None:
+        try:
+            content_type = response.headers.get("content-type", "")
+        except Exception:  # noqa: BLE001
+            content_type = ""
+        entry = {"url": response.url, "status": response.status, "content_type": content_type}
+        all_responses.append(entry)
+        netlog.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        netlog.flush()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, executable_path=CHROMIUM_EXECUTABLE_PATH)
         context = browser.new_context()
         page = context.new_page()
-
-        netlog = open(NETWORK_LOG_PATH, "w", encoding="utf-8")
-
-        def on_response(response) -> None:
-            try:
-                headers = response.headers
-                content_type = headers.get("content-type", "")
-            except Exception:  # noqa: BLE001
-                content_type = ""
-
-            entry = {
-                "url": response.url,
-                "status": response.status,
-                "content_type": content_type,
-                "method": response.request.method,
-            }
-            all_responses.append(entry)
-            netlog.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            netlog.flush()
-
-            if is_page_image_response(content_type, response.url) and len(candidate_pages) < N_TEST_PAGES:
-                try:
-                    body = response.body()
-                except Exception as exc:  # noqa: BLE001
-                    print(f"    could not read body of {response.url}: {exc}")
-                    return
-                already = any(c["url"] == response.url for c in candidate_pages)
-                if not already:
-                    candidate_pages.append({
-                        "url": response.url,
-                        "content_type": content_type,
-                        "bytes": body,
-                    })
-                    print(f"    CAPTURED candidate page image #{len(candidate_pages)}: "
-                          f"{response.url} ({content_type}, {len(body)} bytes)")
-
-        page.on("response", on_response)
+        page.on("response", log_all)
 
         print(f"[1] Opening {LIBRARY_URL}")
         page.goto(LIBRARY_URL, wait_until="networkidle", timeout=30000)
 
-        print("[2] Looking for a 'Μετάβαση' link/button to enter the viewer ...")
+        print("[2] Looking for 'Μετάβαση' link/button to enter the viewer ...")
         clicked = try_click_first(
             page,
-            [
-                "text=Μετάβαση",
-                "a:has-text('Μετάβαση')",
-                "input[value*='Μετάβαση']",
-                "button:has-text('Μετάβαση')",
-            ],
+            ["text=Μετάβαση", "a:has-text('Μετάβαση')", "input[value*='Μετάβαση']", "button:has-text('Μετάβαση')"],
             "Μετάβαση",
         )
         if not clicked:
-            print("    WARNING: automatic click failed. Open recon_viewer.html (dumped below) "
-                  "to find the real link/onclick and update this script's selectors.")
+            print("    WARNING: automatic click failed -- if you're already on display_doc.asp "
+                  "by other means this is fine, otherwise inspect recon_viewer.html below.")
 
         page.wait_for_load_state("networkidle", timeout=30000)
         print(f"[3] URL after navigation: {page.url}")
 
-        (HERE / "recon_viewer.html").write_text(page.content(), encoding="utf-8")
-        for i, frame in enumerate(page.frames):
-            print(f"    frame[{i}] url={frame.url}")
+        main_frame = find_main_frame(page)
+        if not main_frame:
+            print("\nFATAL: no frame with 'main.asp' in its URL was found. Dumping page + frame HTML "
+                  "for manual inspection -- cannot proceed with PDF capture without it.")
+            (HERE / "recon_viewer.html").write_text(page.content(), encoding="utf-8")
+            for i, frame in enumerate(page.frames):
+                try:
+                    (HERE / f"recon_frame_{i}.html").write_text(frame.content(), encoding="utf-8")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"    could not dump frame {i}: {exc}")
+            netlog.close()
+            browser.close()
+            return
+
+        print(f"[4] main.asp frame found: {main_frame.url}")
+
+        for i in range(N_TEST_PAGES):
+            target_current = FIRST_CURRENT_ID + i
+            new_url = CURRENT_RE.sub(f"current={target_current}", main_frame.url)
+            print(f"\n[page {i + 1}/{N_TEST_PAGES}] target current={target_current}")
+
+            pdf_response = None
+
+            # --- Method A: direct frame URL navigation, no click at all. ---
+            print(f"    Method A: navigating main frame directly to {new_url}")
             try:
-                (HERE / f"recon_frame_{i}.html").write_text(frame.content(), encoding="utf-8")
+                with page.expect_response(is_pdf_response, timeout=PDF_WAIT_TIMEOUT_MS) as resp_info:
+                    main_frame.goto(new_url, wait_until="commit", timeout=PDF_WAIT_TIMEOUT_MS)
+                pdf_response = resp_info.value
+                if method_used is None:
+                    method_used = "A (direct frame URL navigation, no click)"
+                print(f"    Method A worked -- application/pdf response: {pdf_response.url}")
+            except PlaywrightTimeoutError:
+                print("    Method A: no application/pdf response within timeout.")
             except Exception as exc:  # noqa: BLE001
-                print(f"    could not dump frame {i}: {exc}")
+                print(f"    Method A: navigation itself failed: {exc}")
 
-        main_frame = next((f for f in page.frames if "main.asp" in f.url), None)
-        if main_frame:
-            print(f"[4] Found a main.asp frame: {main_frame.url}")
-            m = CURRENT_RE.search(main_frame.url)
-            if m:
-                print(f"    First page current= value: {m.group(1)}")
-        else:
-            print("[4] WARNING: no frame with 'main.asp' in its URL found. "
-                  "Check recon_viewer.html / recon_frame_*.html manually -- "
-                  "the viewer may use a different frame name or load main.asp via JS/XHR "
-                  "instead of a plain <iframe src=...>.")
+            # --- Method B: click a real 'next page' control. ---
+            if pdf_response is None:
+                print("    Trying Method B: clicking a 'next page' control ...")
+                dump_next_page_candidates(main_frame)
+                try:
+                    with page.expect_response(is_pdf_response, timeout=PDF_WAIT_TIMEOUT_MS) as resp_info:
+                        if not try_click_first(main_frame, NEXT_PAGE_SELECTORS, f"next-page-{i + 1}"):
+                            raise RuntimeError("no guessed selector matched any element")
+                    pdf_response = resp_info.value
+                    if method_used is None:
+                        method_used = "B (clicking a next-page control)"
+                    print(f"    Method B worked -- application/pdf response: {pdf_response.url}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"    Method B also failed for current={target_current}: {exc}")
+                    print("    Skipping this page -- see recon_network_log.jsonl and the onclick dump above.")
+                    continue
 
-        target = main_frame or page
-        print("[4b] Inline <img>/<embed>/<object> elements in the viewer frame:")
-        for tag, attr in [("img", "src"), ("embed", "src"), ("object", "data")]:
-            try:
-                for el in target.locator(tag).all():
-                    src = el.get_attribute(attr)
-                    if src:
-                        print(f"    <{tag} {attr}='{src}'>")
-            except Exception:  # noqa: BLE001
-                pass
-
-        print(f"\n[5] Clicking 'next page' up to {N_TEST_PAGES - 1} more times "
-              f"(need {N_TEST_PAGES} pages total for the Phase 1 test download) ...")
-        for i in range(N_TEST_PAGES - 1):
-            clicked_next = try_click_first(
-                target,
-                [
-                    "text=Επόμενη",
-                    "a:has-text('Επόμενη')",
-                    "img[alt*='next' i]",
-                    "img[alt*='επόμεν' i]",
-                    "[title*='επόμεν' i]",
-                ],
-                f"next-page-{i + 1}",
-            )
-            if not clicked_next:
-                print(f"    step {i + 1}: could not find a 'next page' control automatically. "
-                      f"Inspect recon_frame_*.html for the real element/onclick "
-                      f"(likely something calling main.asp?current={{N+1}} directly) and fix this script.")
-                break
-            page.wait_for_timeout(1500)
-            current_frame = next((f for f in page.frames if "main.asp" in f.url), main_frame)
-            print(f"    step {i + 1}: viewer frame url now = {current_frame.url if current_frame else page.url}")
+            body = pdf_response.body()
+            captured_pages.append({
+                "sequence_number": len(captured_pages) + 1,
+                "current_id": target_current,
+                "source_url": pdf_response.url,
+                "content_type": pdf_response.headers.get("content-type", ""),
+                "bytes_data": body,
+            })
+            print(f"    captured {len(body)} bytes")
 
         netlog.close()
         browser.close()
 
-    print(f"\n[6] Logged {len(all_responses)} network responses -> {NETWORK_LOG_PATH}")
-    print(f"[7] Captured {len(candidate_pages)}/{N_TEST_PAGES} candidate page images/PDFs.")
+    print(f"\n[Result] Logged {len(all_responses)} total network responses -> {NETWORK_LOG_PATH}")
+    print(f"[Result] Navigation method that worked: {method_used or 'NEITHER -- see per-page errors above'}")
+    print(f"[Result] Captured {len(captured_pages)}/{N_TEST_PAGES} real application/pdf pages.")
 
-    if candidate_pages:
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        manifest_pages = []
-        for i, cand in enumerate(candidate_pages, start=1):
-            ext = ext_for(cand["content_type"], cand["url"])
-            filename = f"page_{i:04d}{ext}"
-            dest = OUT_DIR / filename
-            dest.write_bytes(cand["bytes"])
-            m = CURRENT_RE.search(cand["url"])
-            current_id = m.group(1) if m else None
-            manifest_pages.append({
-                "sequence_number": i,
-                "current_id": current_id,
-                "source_url": cand["url"],
-                "content_type": cand["content_type"],
-                "local_filename": filename,
-                "bytes": len(cand["bytes"]),
-                "sha256": sha256_bytes(cand["bytes"]),
-            })
-            print(f"    saved {dest} ({len(cand['bytes'])} bytes, current_id={current_id})")
+    if not captured_pages:
+        print("\nNo PDF pages captured at all. Inspect recon_network_log.jsonl for what actually "
+              "fired during navigation attempts, and the onclick dumps above for the real "
+              "'next page' control if Method A didn't work.")
+        return
 
-        manifest = {
-            "newspaper": "ΑΚΡΟΠΟΛΙΣ",
-            "source": "digitallib.parliament.gr",
-            "item": ITEM,
-            "phase": "1-reconnaissance-test",
-            "pages": manifest_pages,
-        }
-        MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"\nWrote manifest: {MANIFEST_PATH}")
+    manifest_pages = []
+    for p_ in captured_pages:
+        filename = f"page_{p_['sequence_number']:04d}.pdf"
+        dest = OUT_DIR / filename
+        dest.write_bytes(p_["bytes_data"])
+        digest = sha256_bytes(p_["bytes_data"])
+        manifest_pages.append({
+            "sequence_number": p_["sequence_number"],
+            "current_id": p_["current_id"],
+            "source_url": p_["source_url"],
+            "content_type": p_["content_type"],
+            "local_filename": filename,
+            "bytes": len(p_["bytes_data"]),
+            "sha256": digest,
+        })
+        print(f"    saved {dest} ({len(p_['bytes_data'])} bytes) current_id={p_['current_id']} sha256={digest[:16]}...")
 
-        current_ids = [p["current_id"] for p in manifest_pages if p["current_id"] is not None]
-        if len(current_ids) >= 2:
-            ints = [int(c) for c in current_ids]
-            deltas = [b - a for a, b in zip(ints, ints[1:])]
-            print(f"\ncurrent= values observed: {ints}")
-            print(f"deltas between consecutive pages: {deltas} "
-                  f"({'all +1 -- consistent with 456 sequential pages' if all(d == 1 for d in deltas) else 'NOT all +1 -- investigate before assuming linear coverage'})")
+    manifest = {
+        "newspaper": "ΑΚΡΟΠΟΛΙΣ",
+        "source": "digitallib.parliament.gr",
+        "item": ITEM,
+        "phase": "1-reconnaissance-test-pdf",
+        "navigation_method": method_used,
+        "pages": manifest_pages,
+    }
+    MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nWrote manifest: {MANIFEST_PATH}")
+
+    sizes = [p["bytes"] for p in manifest_pages]
+    print(f"\nPage sizes (bytes): {sizes}")
+    small = [p for p in manifest_pages if p["bytes"] < SMALL_FILE_WARNING_BYTES]
+    if small:
+        print(f"WARNING: {len(small)} captured page(s) are under {SMALL_FILE_WARNING_BYTES} bytes -- "
+              f"these may be decorative/placeholder PDFs rather than real scanned pages. "
+              f"Open them manually to check before trusting this pattern for the full 456-page crawl.")
     else:
-        print("\nNo candidate page images/PDFs were auto-captured. Inspect "
-              f"{NETWORK_LOG_PATH} by hand for the response whose content-type is "
-              "image/* or application/pdf, and/or open recon_frame_*.html to find "
-              "the real <img>/<embed> src -- then adjust is_page_image_response()/"
-              "the click selectors above accordingly.")
+        print("All captured pages are comfortably above the placeholder-size threshold -- "
+              "consistent with real scanned page content.")
+
+    current_ids = [p["current_id"] for p in manifest_pages]
+    if len(current_ids) >= 2:
+        deltas = [b - a for a, b in zip(current_ids, current_ids[1:])]
+        print(f"\ncurrent= values used: {current_ids}")
+        print(f"deltas: {deltas} "
+              f"({'all +1, as expected' if all(d == 1 for d in deltas) else 'NOT all +1 -- unexpected'})")
 
 
 if __name__ == "__main__":
