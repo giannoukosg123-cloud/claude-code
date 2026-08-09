@@ -111,6 +111,79 @@ def find_main_frame(page):
     return next((f for f in page.frames if "main.asp" in f.url), None)
 
 
+def dump_forms_and_selects(page) -> None:
+    """Diagnostic: log every <select> (name/id/options) and <form>
+    (action/method) on the page, so a wrong/guessed selector or a value
+    that needs explicit selecting is visible instead of silently assumed."""
+    print("    <select> elements:")
+    try:
+        selects = page.locator("select").all()
+    except Exception as exc:  # noqa: BLE001
+        selects = []
+        print(f"      could not query <select> elements: {exc}")
+    if not selects:
+        print("      (none found)")
+    for sel_el in selects:
+        name = sel_el.get_attribute("name")
+        id_ = sel_el.get_attribute("id")
+        options = []
+        try:
+            for opt in sel_el.locator("option").all():
+                options.append({
+                    "value": opt.get_attribute("value"),
+                    "text": opt.inner_text().strip(),
+                    "selected": opt.get_attribute("selected") is not None,
+                })
+        except Exception as exc:  # noqa: BLE001
+            print(f"      could not read options: {exc}")
+        print(f"      <select name={name!r} id={id_!r}> options={options}")
+
+    print("    <form> elements:")
+    try:
+        forms = page.locator("form").all()
+    except Exception as exc:  # noqa: BLE001
+        forms = []
+        print(f"      could not query <form> elements: {exc}")
+    if not forms:
+        print("      (none found)")
+    for form_el in forms:
+        print(f"      <form action={form_el.get_attribute('action')!r} "
+              f"method={form_el.get_attribute('method')!r} "
+              f"name={form_el.get_attribute('name')!r}>")
+
+
+def try_explicit_select_for_item(page, item: int) -> bool:
+    """If any <select> has an option whose value or text mentions our item
+    number, select it explicitly -- a visually-preselected <option> does
+    NOT guarantee the underlying JS/form state actually reflects it."""
+    item_str = str(item)
+    try:
+        selects = page.locator("select").all()
+    except Exception:  # noqa: BLE001
+        return False
+    for sel_el in selects:
+        name = sel_el.get_attribute("name")
+        id_ = sel_el.get_attribute("id")
+        try:
+            options = sel_el.locator("option").all()
+        except Exception:  # noqa: BLE001
+            continue
+        for opt in options:
+            value = opt.get_attribute("value") or ""
+            text = opt.inner_text().strip()
+            if item_str in value or item_str in text:
+                target_sel = f"select[name='{name}']" if name else (f"#{id_}" if id_ else None)
+                if not target_sel:
+                    continue
+                try:
+                    page.select_option(target_sel, value=value if value else None, label=None if value else text)
+                    print(f"    explicitly selected option (value={value!r}, text={text!r}) in {target_sel}")
+                    return True
+                except Exception as exc:  # noqa: BLE001
+                    print(f"    select_option on {target_sel} failed: {exc}")
+    return False
+
+
 def dump_next_page_candidates(frame) -> None:
     """Diagnostic only: elements whose onclick mentions 'current' are the
     most likely real 'next page' control if the guessed selectors above
@@ -164,24 +237,57 @@ def main() -> None:
 
         print(f"[1] Opening {LIBRARY_URL}")
         page.goto(LIBRARY_URL, wait_until="networkidle", timeout=30000)
+        (HERE / "recon_before_click.html").write_text(page.content(), encoding="utf-8")
 
-        print("[2] Looking for 'Μετάβαση' link/button to enter the viewer ...")
+        print("[2] Inspecting <select>/<form> elements before touching anything ...")
+        dump_forms_and_selects(page)
+
+        print(f"[2b] Explicitly selecting the option for item={ITEM}, if one exists "
+              f"(a visually-preselected <option> doesn't guarantee JS/form state agrees) ...")
+        explicitly_selected = try_explicit_select_for_item(page, ITEM)
+        if not explicitly_selected:
+            print("    No matching <option> found to select explicitly -- proceeding as-is.")
+
+        print("[3] Clicking 'Μετάβαση' link/button to enter the viewer ...")
         clicked = try_click_first(
             page,
             ["text=Μετάβαση", "a:has-text('Μετάβαση')", "input[value*='Μετάβαση']", "button:has-text('Μετάβαση')"],
             "Μετάβαση",
         )
-        if not clicked:
-            print("    WARNING: automatic click failed -- if you're already on display_doc.asp "
-                  "by other means this is fine, otherwise inspect recon_viewer.html below.")
 
-        page.wait_for_load_state("networkidle", timeout=30000)
-        print(f"[3] URL after navigation: {page.url}")
+        # Dump state IMMEDIATELY after the click, before any wait/timeout,
+        # so a JS/ajax-driven navigation's transient state is captured too.
+        (HERE / "recon_after_click.html").write_text(page.content(), encoding="utf-8")
+        print(f"    URL immediately after click (before any wait): {page.url}")
+        if not clicked:
+            print("    WARNING: no selector matched a clickable 'Μετάβαση' element at all -- "
+                  "see recon_before_click.html for the real markup.")
+
+        print("[4] Waiting for navigation to settle (networkidle, up to 45s) ...")
+        try:
+            page.wait_for_load_state("networkidle", timeout=45000)
+        except PlaywrightTimeoutError:
+            print("    WARNING: networkidle wait timed out -- page may be doing long-polling/ajax "
+                  "that never goes idle. Continuing to check the URL/frames anyway.")
+
+        print(f"[4b] URL after waiting: {page.url}")
+        (HERE / "recon_after_wait.html").write_text(page.content(), encoding="utf-8")
+
+        if page.url == LIBRARY_URL or "display_doc.asp" not in page.url:
+            print(f"    URL did not change to display_doc.asp (still {page.url}). "
+                  f"Trying an explicit wait_for_url('display_doc') as a second chance (15s) ...")
+            try:
+                page.wait_for_url(re.compile("display_doc", re.IGNORECASE), timeout=15000)
+                print(f"    wait_for_url succeeded -- URL now: {page.url}")
+            except PlaywrightTimeoutError:
+                print(f"    wait_for_url also timed out -- URL is still: {page.url}")
 
         main_frame = find_main_frame(page)
         if not main_frame:
             print("\nFATAL: no frame with 'main.asp' in its URL was found. Dumping page + frame HTML "
-                  "for manual inspection -- cannot proceed with PDF capture without it.")
+                  "for manual inspection -- cannot proceed with PDF capture without it. Check "
+                  "recon_before_click.html vs recon_after_click.html vs recon_after_wait.html to see "
+                  "exactly what changed (if anything) after the click.")
             (HERE / "recon_viewer.html").write_text(page.content(), encoding="utf-8")
             for i, frame in enumerate(page.frames):
                 try:
@@ -192,7 +298,7 @@ def main() -> None:
             browser.close()
             return
 
-        print(f"[4] main.asp frame found: {main_frame.url}")
+        print(f"[5] main.asp frame found: {main_frame.url}")
 
         for i in range(N_TEST_PAGES):
             target_current = FIRST_CURRENT_ID + i
