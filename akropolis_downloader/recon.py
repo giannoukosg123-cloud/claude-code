@@ -19,7 +19,7 @@ blocks digitallib.parliament.gr, so none of this has been reproduced here):
     once per page, keyed by *which current= value was active when it fired*
     (not by parsing the PDF response's own URL, which carries no page info).
 
-This script now filters exclusively on Content-Type: application/pdf (never
+This script filters exclusively on Content-Type: application/pdf (never
 images/CSS/JS) and tries two navigation strategies per page, to determine
 which one reliably triggers that PDF request:
 
@@ -30,6 +30,19 @@ which one reliably triggers that PDF request:
      exact selector is NOT confirmed against live markup, so this also
      dumps every element with an onclick mentioning "current" as a
      diagnostic in case the guessed selectors below don't match.
+
+A live run of Method A surfaced a real trap: navigating straight to a PDF
+URL hands rendering to Chromium's OWN built-in PDF viewer (a component
+extension, chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/...), which
+then issues its own internal requests for its UI resources. Those got
+mistaken for the real page content (536-byte "PDFs" that were actually
+viewer-internal placeholders). Rather than depend on fragile/version-
+specific Chromium flags to disable that built-in viewer, the capture logic
+itself is now made immune to it: any response is rejected outright (never
+silently accepted) if its URL starts with "chrome-extension://", or if its
+body is smaller than MIN_VALID_PDF_BYTES -- real scanned pages are ~1-2MB,
+so anything under that bar is refused as a placeholder and the wait
+continues for a real candidate. See wait_for_real_pdf().
 
 Usage:
     pip install playwright
@@ -43,6 +56,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -67,7 +81,10 @@ CHROMIUM_EXECUTABLE_PATH = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH") or None
 FIRST_CURRENT_ID = int(os.environ.get("AKROPOLIS_FIRST_CURRENT", "7154207"))
 N_TEST_PAGES = 5
 PDF_WAIT_TIMEOUT_MS = 20000
-SMALL_FILE_WARNING_BYTES = 100_000  # a real scanned page should be well over this
+# Real scanned pages are ~1-2MB. Anything under this is refused outright as
+# a placeholder/viewer-internal artifact -- never silently accepted.
+MIN_VALID_PDF_BYTES = 50_000
+SMALL_FILE_WARNING_BYTES = 100_000  # secondary post-hoc sanity check, above MIN_VALID_PDF_BYTES
 
 CURRENT_RE = re.compile(r"current=(\d+)")
 
@@ -82,12 +99,57 @@ NEXT_PAGE_SELECTORS = [
 ]
 
 
-def is_pdf_response(response) -> bool:
+def wait_for_real_pdf(page, trigger, timeout_ms: int, label: str):
+    """Call trigger() (a navigation or click expected to fetch the real page
+    PDF), then watch every response until one qualifies as REAL page
+    content: not chrome-extension:// (Chromium's built-in PDF viewer's own
+    internal resources), genuinely Content-Type: application/pdf, and at
+    least MIN_VALID_PDF_BYTES large. Anything else is logged as a rejected
+    candidate, never silently accepted, and the wait continues. Returns
+    (response, body) or (None, None) on timeout."""
+    state: dict = {}
+    rejected: list[str] = []
+
+    def handler(response) -> None:
+        if "body" in state:
+            return
+        if response.url.startswith("chrome-extension://"):
+            rejected.append(f"{response.url} (chrome-extension:// -- internal PDF viewer resource, not real content)")
+            return
+        try:
+            content_type = response.headers.get("content-type", "")
+        except Exception:  # noqa: BLE001
+            return
+        if content_type.split(";")[0].strip().lower() != "application/pdf":
+            return
+        try:
+            body = response.body()
+        except Exception as exc:  # noqa: BLE001
+            rejected.append(f"{response.url} (could not read body: {exc})")
+            return
+        if len(body) < MIN_VALID_PDF_BYTES:
+            rejected.append(f"{response.url} ({len(body)} bytes -- below {MIN_VALID_PDF_BYTES}, treated as placeholder)")
+            return
+        state["response"] = response
+        state["body"] = body
+
+    page.on("response", handler)
     try:
-        content_type = response.headers.get("content-type", "")
-    except Exception:  # noqa: BLE001
-        return False
-    return content_type.split(";")[0].strip().lower() == "application/pdf"
+        trigger()
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline and "body" not in state:
+            page.wait_for_timeout(200)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    [{label}] trigger action itself failed: {exc}")
+    finally:
+        page.remove_listener("response", handler)
+
+    for r in rejected:
+        print(f"    [{label}] rejected candidate: {r}")
+
+    if "body" in state:
+        return state["response"], state["body"]
+    return None, None
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -328,39 +390,42 @@ def main() -> None:
             print(f"\n[page {i + 1}/{N_TEST_PAGES}] target current={target_current}")
 
             pdf_response = None
+            body = None
 
             # --- Method A: direct frame URL navigation, no click at all. ---
             print(f"    Method A: navigating main frame directly to {new_url}")
-            try:
-                with viewer_page.expect_response(is_pdf_response, timeout=PDF_WAIT_TIMEOUT_MS) as resp_info:
-                    main_frame.goto(new_url, wait_until="commit", timeout=PDF_WAIT_TIMEOUT_MS)
-                pdf_response = resp_info.value
+            pdf_response, body = wait_for_real_pdf(
+                viewer_page,
+                lambda u=new_url: main_frame.goto(u, wait_until="commit", timeout=PDF_WAIT_TIMEOUT_MS),
+                PDF_WAIT_TIMEOUT_MS,
+                "Method A",
+            )
+            if pdf_response is not None:
                 if method_used is None:
                     method_used = "A (direct frame URL navigation, no click)"
-                print(f"    Method A worked -- application/pdf response: {pdf_response.url}")
-            except PlaywrightTimeoutError:
-                print("    Method A: no application/pdf response within timeout.")
-            except Exception as exc:  # noqa: BLE001
-                print(f"    Method A: navigation itself failed: {exc}")
+                print(f"    Method A worked -- real application/pdf response: {pdf_response.url} ({len(body)} bytes)")
+            else:
+                print("    Method A: no valid (non-placeholder, non-extension) application/pdf response within timeout.")
 
             # --- Method B: click a real 'next page' control. ---
             if pdf_response is None:
                 print("    Trying Method B: clicking a 'next page' control ...")
                 dump_next_page_candidates(main_frame)
-                try:
-                    with viewer_page.expect_response(is_pdf_response, timeout=PDF_WAIT_TIMEOUT_MS) as resp_info:
-                        if not try_click_first(main_frame, NEXT_PAGE_SELECTORS, f"next-page-{i + 1}"):
-                            raise RuntimeError("no guessed selector matched any element")
-                    pdf_response = resp_info.value
+
+                def click_next(i=i):
+                    if not try_click_first(main_frame, NEXT_PAGE_SELECTORS, f"next-page-{i + 1}"):
+                        raise RuntimeError("no guessed selector matched any element")
+
+                pdf_response, body = wait_for_real_pdf(viewer_page, click_next, PDF_WAIT_TIMEOUT_MS, "Method B")
+                if pdf_response is not None:
                     if method_used is None:
                         method_used = "B (clicking a next-page control)"
-                    print(f"    Method B worked -- application/pdf response: {pdf_response.url}")
-                except Exception as exc:  # noqa: BLE001
-                    print(f"    Method B also failed for current={target_current}: {exc}")
-                    print("    Skipping this page -- see recon_network_log.jsonl and the onclick dump above.")
+                    print(f"    Method B worked -- real application/pdf response: {pdf_response.url} ({len(body)} bytes)")
+                else:
+                    print(f"    Method B also failed for current={target_current}.")
+                    print("    Skipping this page -- see rejected-candidate lines above and recon_network_log.jsonl.")
                     continue
 
-            body = pdf_response.body()
             captured_pages.append({
                 "sequence_number": len(captured_pages) + 1,
                 "current_id": target_current,
