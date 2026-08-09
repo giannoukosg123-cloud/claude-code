@@ -248,48 +248,69 @@ def main() -> None:
         if not explicitly_selected:
             print("    No matching <option> found to select explicitly -- proceeding as-is.")
 
-        print("[3] Clicking 'Μετάβαση' link/button to enter the viewer ...")
-        clicked = try_click_first(
-            page,
-            ["text=Μετάβαση", "a:has-text('Μετάβαση')", "input[value*='Μετάβαση']", "button:has-text('Μετάβαση')"],
-            "Μετάβαση",
-        )
-
-        # Dump state IMMEDIATELY after the click, before any wait/timeout,
-        # so a JS/ajax-driven navigation's transient state is captured too.
-        (HERE / "recon_after_click.html").write_text(page.content(), encoding="utf-8")
-        print(f"    URL immediately after click (before any wait): {page.url}")
-        if not clicked:
-            print("    WARNING: no selector matched a clickable 'Μετάβαση' element at all -- "
-                  "see recon_before_click.html for the real markup.")
-
-        print("[4] Waiting for navigation to settle (networkidle, up to 45s) ...")
+        print("[3] Clicking 'Μετάβαση' link/button, watching for a possible new tab/popup "
+              "(known cause: this site opens the viewer via window.open/target=_blank) ...")
+        MET_SELECTORS = [
+            "text=Μετάβαση", "a:has-text('Μετάβαση')", "input[value*='Μετάβαση']", "button:has-text('Μετάβαση')",
+        ]
+        new_page = None
+        clicked = False
         try:
-            page.wait_for_load_state("networkidle", timeout=45000)
+            with context.expect_page(timeout=15000) as new_page_info:
+                clicked = try_click_first(page, MET_SELECTORS, "Μετάβαση")
+                if not clicked:
+                    raise RuntimeError("no selector matched a clickable 'Μετάβαση' element")
+            new_page = new_page_info.value
+            new_page.on("response", log_all)
+            new_page.wait_for_load_state("networkidle", timeout=45000)
+            print(f"    A new tab/window opened, as suspected: {new_page.url}")
         except PlaywrightTimeoutError:
-            print("    WARNING: networkidle wait timed out -- page may be doing long-polling/ajax "
-                  "that never goes idle. Continuing to check the URL/frames anyway.")
+            print("    No new tab/window opened within 15s after the click -- "
+                  "falling back to same-page navigation handling.")
+        except RuntimeError as exc:
+            print(f"    {exc} -- see recon_before_click.html for the real markup.")
 
-        print(f"[4b] URL after waiting: {page.url}")
-        (HERE / "recon_after_wait.html").write_text(page.content(), encoding="utf-8")
+        # Work on whichever page object actually holds the viewer: the new
+        # tab if one opened, otherwise the original page (same-page fallback).
+        viewer_page = new_page if new_page is not None else page
 
-        if page.url == LIBRARY_URL or "display_doc.asp" not in page.url:
-            print(f"    URL did not change to display_doc.asp (still {page.url}). "
-                  f"Trying an explicit wait_for_url('display_doc') as a second chance (15s) ...")
+        # Dump state right away, before any further waiting, from whichever
+        # page is now the viewer candidate.
+        (HERE / "recon_after_click.html").write_text(viewer_page.content(), encoding="utf-8")
+        print(f"    URL right after click handling: {viewer_page.url}")
+
+        if new_page is None:
+            # Same-page fallback path: give it the same settle/second-chance
+            # treatment as before, in case this site sometimes does navigate
+            # in-place instead of popping a new tab.
+            print("[4] Waiting for navigation to settle (networkidle, up to 45s) ...")
             try:
-                page.wait_for_url(re.compile("display_doc", re.IGNORECASE), timeout=15000)
-                print(f"    wait_for_url succeeded -- URL now: {page.url}")
+                viewer_page.wait_for_load_state("networkidle", timeout=45000)
             except PlaywrightTimeoutError:
-                print(f"    wait_for_url also timed out -- URL is still: {page.url}")
+                print("    WARNING: networkidle wait timed out -- page may be doing long-polling/ajax "
+                      "that never goes idle. Continuing to check the URL/frames anyway.")
 
-        main_frame = find_main_frame(page)
+            print(f"[4b] URL after waiting: {viewer_page.url}")
+            (HERE / "recon_after_wait.html").write_text(viewer_page.content(), encoding="utf-8")
+
+            if viewer_page.url == LIBRARY_URL or "display_doc.asp" not in viewer_page.url:
+                print(f"    URL did not change to display_doc.asp (still {viewer_page.url}). "
+                      f"Trying an explicit wait_for_url('display_doc') as a second chance (15s) ...")
+                try:
+                    viewer_page.wait_for_url(re.compile("display_doc", re.IGNORECASE), timeout=15000)
+                    print(f"    wait_for_url succeeded -- URL now: {viewer_page.url}")
+                except PlaywrightTimeoutError:
+                    print(f"    wait_for_url also timed out -- URL is still: {viewer_page.url}")
+
+        main_frame = find_main_frame(viewer_page)
         if not main_frame:
-            print("\nFATAL: no frame with 'main.asp' in its URL was found. Dumping page + frame HTML "
-                  "for manual inspection -- cannot proceed with PDF capture without it. Check "
-                  "recon_before_click.html vs recon_after_click.html vs recon_after_wait.html to see "
-                  "exactly what changed (if anything) after the click.")
-            (HERE / "recon_viewer.html").write_text(page.content(), encoding="utf-8")
-            for i, frame in enumerate(page.frames):
+            print("\nFATAL: no frame with 'main.asp' in its URL was found "
+                  f"({'in the new tab' if new_page is not None else 'on the original page'}). "
+                  "Dumping page + frame HTML for manual inspection -- cannot proceed with PDF "
+                  "capture without it. Check recon_before_click.html vs recon_after_click.html "
+                  "(vs recon_after_wait.html, if no new tab opened) to see exactly what changed.")
+            (HERE / "recon_viewer.html").write_text(viewer_page.content(), encoding="utf-8")
+            for i, frame in enumerate(viewer_page.frames):
                 try:
                     (HERE / f"recon_frame_{i}.html").write_text(frame.content(), encoding="utf-8")
                 except Exception as exc:  # noqa: BLE001
@@ -298,7 +319,8 @@ def main() -> None:
             browser.close()
             return
 
-        print(f"[5] main.asp frame found: {main_frame.url}")
+        print(f"[5] main.asp frame found "
+              f"{'in the new tab/window' if new_page is not None else 'on the original page'}: {main_frame.url}")
 
         for i in range(N_TEST_PAGES):
             target_current = FIRST_CURRENT_ID + i
@@ -310,7 +332,7 @@ def main() -> None:
             # --- Method A: direct frame URL navigation, no click at all. ---
             print(f"    Method A: navigating main frame directly to {new_url}")
             try:
-                with page.expect_response(is_pdf_response, timeout=PDF_WAIT_TIMEOUT_MS) as resp_info:
+                with viewer_page.expect_response(is_pdf_response, timeout=PDF_WAIT_TIMEOUT_MS) as resp_info:
                     main_frame.goto(new_url, wait_until="commit", timeout=PDF_WAIT_TIMEOUT_MS)
                 pdf_response = resp_info.value
                 if method_used is None:
@@ -326,7 +348,7 @@ def main() -> None:
                 print("    Trying Method B: clicking a 'next page' control ...")
                 dump_next_page_candidates(main_frame)
                 try:
-                    with page.expect_response(is_pdf_response, timeout=PDF_WAIT_TIMEOUT_MS) as resp_info:
+                    with viewer_page.expect_response(is_pdf_response, timeout=PDF_WAIT_TIMEOUT_MS) as resp_info:
                         if not try_click_first(main_frame, NEXT_PAGE_SELECTORS, f"next-page-{i + 1}"):
                             raise RuntimeError("no guessed selector matched any element")
                     pdf_response = resp_info.value
