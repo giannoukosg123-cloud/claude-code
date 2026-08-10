@@ -19,7 +19,10 @@ from . import config
 
 
 def setup_logger(record: config.Record) -> logging.Logger:
-    config.LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    # record.log_path.parent is LOG_ROOT for a standard record, but the
+    # record's own custom_root for one that overrides it (e.g. a Desktop
+    # folder) -- that directory may not exist yet either.
+    record.log_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger(f"parliament_downloader.item{record.item}.seg{record.seg}")
     logger.setLevel(logging.INFO)

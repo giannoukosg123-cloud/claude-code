@@ -25,7 +25,7 @@ def new_manifest(record: config.Record, discovered_scans: int) -> Dict[str, Any]
 
 
 def scan_filename(record: config.Record, logical_position: int, current_id: int) -> str:
-    return f"AKROPOLIS_item{record.item}_seg{record.seg}_scan_{logical_position:04d}_current_{current_id}.pdf"
+    return f"{record.newspaper_code}_item{record.item}_seg{record.seg}_scan_{logical_position:04d}_current_{current_id}.pdf"
 
 
 def new_scan_entry(record: config.Record, logical_position: int, current_id: int, source_url: str) -> Dict[str, Any]:

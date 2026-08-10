@@ -56,13 +56,30 @@ class Record:
     title: str
     segment_label: str
     expected_scans: int
+    # Filename prefix for scan PDFs (e.g. "AKROPOLIS" -> AKROPOLIS_item...).
+    newspaper_code: str = "AKROPOLIS"
+    # Filename prefix for the log file (e.g. "akropolis" -> akropolis_item...).
+    log_prefix: str = "akropolis"
+    # None (default) -> the standard data/raw/akropolis/item_X/seg_Y layout
+    # under DATA_ROOT/LOG_ROOT. Set to an absolute path to store this
+    # record entirely under that path instead (e.g. a specific Desktop
+    # folder) -- manifest.json and the log file then live directly in it too.
+    custom_root: Optional[pathlib.Path] = None
+    # True (default) -> scans go in a "scans" subfolder under record_root.
+    # False -> scans are written directly into record_root itself, no
+    # nested subfolder (only meaningful together with custom_root).
+    scans_in_subfolder: bool = True
 
     @property
     def record_root(self) -> pathlib.Path:
+        if self.custom_root is not None:
+            return self.custom_root
         return DATA_ROOT / "raw" / "akropolis" / f"item_{self.item}" / f"seg_{self.seg}"
 
     @property
     def scans_dir(self) -> pathlib.Path:
+        if not self.scans_in_subfolder:
+            return self.record_root
         return self.record_root / "scans"
 
     @property
@@ -71,7 +88,10 @@ class Record:
 
     @property
     def log_path(self) -> pathlib.Path:
-        return LOG_ROOT / f"akropolis_item{self.item}_seg{self.seg}.log"
+        filename = f"{self.log_prefix}_item{self.item}_seg{self.seg}.log"
+        if self.custom_root is not None:
+            return self.record_root / filename
+        return LOG_ROOT / filename
 
 
 RECORDS: Dict[Tuple[int, int], Record] = {
@@ -90,6 +110,21 @@ RECORDS: Dict[Tuple[int, int], Record] = {
     (40483, 7591): Record(
         item=40483, seg=7591, title="ΑΚΡΟΠΟΛΙΣ",
         segment_label="ΑΚΡΟΠΟΛΙΣ - 1/10/1935 - 31/12/1935", expected_scans=486,
+    ),
+    (36894, 4219): Record(
+        item=36894, seg=4219, title="ΕΣΠΕΡΙΝΗ",
+        segment_label="ΕΣΠΕΡΙΝΗ - 1/10/1925 - 31/12/1925", expected_scans=256,
+        newspaper_code="ESPERINI", log_prefix="esperini",
+        # Explicit per user request: NOT under data/raw/akropolis/ -- stored
+        # directly in this Desktop folder, scans with no "scans/" subfolder,
+        # manifest.json and the log colocated in the same folder. This
+        # string is only meaningful as a real path when the code actually
+        # runs on the Windows machine that folder exists on -- pathlib
+        # resolves it to WindowsPath there (backslash-separated) and to a
+        # single mangled POSIX filename anywhere else, so this record must
+        # never be exercised for real outside that machine.
+        custom_root=pathlib.Path(r"C:\Users\user\Desktop\Εσπερινή 1925 10 - 12"),
+        scans_in_subfolder=False,
     ),
 }
 
