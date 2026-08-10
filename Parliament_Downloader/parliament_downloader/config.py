@@ -138,6 +138,18 @@ RECORDS: Dict[Tuple[int, int], Record] = {
         custom_root=pathlib.Path(r"C:\Users\user\Desktop\Αθήναι 1925 1 - 6"),
         scans_in_subfolder=False,
     ),
+    (43441, 10536): Record(
+        item=43441, seg=10536, title="ΑΘΗΝΑΪΚΗ",
+        segment_label="ΑΘΗΝΑΪΚΗ - ΜΑΪΟΣ - ΑΥΓ. 1925", expected_scans=404,
+        newspaper_code="ATHINAIKI", log_prefix="athinaiki",
+        # Same custom-root pattern as ΕΣΠΕΡΙΝΗ/ΑΘΗΝΑΙ: NOT under
+        # data/raw/akropolis/, stored directly in this Desktop folder, no
+        # "scans/" subfolder, manifest.json and the log colocated in the
+        # same folder. Only resolves as a real path on the Windows machine
+        # that folder exists on -- see the ΕΣΠΕΡΙΝΗ record's comment above.
+        custom_root=pathlib.Path(r"C:\Users\user\Desktop\Αθηναϊκή 1925 5 - 8"),
+        scans_in_subfolder=False,
+    ),
 }
 
 DEFAULT_RECORD = RECORDS[(40489, 7597)]
