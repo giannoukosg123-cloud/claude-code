@@ -87,6 +87,10 @@ RECORDS: Dict[Tuple[int, int], Record] = {
         item=40482, seg=7590, title="ΑΚΡΟΠΟΛΙΣ",
         segment_label="ΑΚΡΟΠΟΛΙΣ - 1/7/1935 - 30/9/1935", expected_scans=456,
     ),
+    (40483, 7591): Record(
+        item=40483, seg=7591, title="ΑΚΡΟΠΟΛΙΣ",
+        segment_label="ΑΚΡΟΠΟΛΙΣ - 1/10/1935 - 31/12/1935", expected_scans=486,
+    ),
 }
 
 DEFAULT_RECORD = RECORDS[(40489, 7597)]
